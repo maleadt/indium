@@ -229,6 +229,17 @@ static size_t allocationSize(const Iridium::SPIRV::Type& type) {
 	return (type.size + type.alignment - 1) & ~(type.alignment - 1);
 }
 
+// The type of every physical pointer value: buffer arguments, pointers loaded from memory and getelementptr results.
+// Nothing reads the pointee: a getelementptr computes its byte offset from its own source element type, and loads,
+// stores and atomics re-type the pointer to the type they access. One type for all of them lets a phi or select merge
+// any two, and a buffer whose element type the module doesn't declare (a struct only named in air.arg_type_name)
+// needs no type at all.
+static Iridium::SPIRV::ResultID physicalPointerType(Iridium::SPIRV::Builder& builder) {
+	using namespace Iridium::SPIRV;
+	auto word = builder.declareType(Type(Type::IntegerTag {}, 32, false));
+	return builder.declareType(Type(Type::PointerTag {}, StorageClass::PhysicalStorageBuffer, word, 8));
+}
+
 static Iridium::SPIRV::ResultID llvmTypeToSPIRVType(Iridium::SPIRV::Builder& builder, LLVMTypeRef llvmType) {
 	using namespace Iridium::SPIRV;
 
@@ -312,13 +323,13 @@ static Iridium::SPIRV::ResultID llvmTypeToSPIRVType(Iridium::SPIRV::Builder& bui
 		} break;
 
 		case LLVMPointerTypeKind: {
-			// AIR is compiled with opaque pointers, so LLVMGetElementType on a
-			// "ptr" returns garbage rather than null, and recursing into it
-			// dereferenced that garbage. The pointee type now only exists in
-			// the AIR argument descriptors (air.arg_type_name), which callers
-			// resolve themselves; a bare pointer type here carries no pointee
-			// we could recover, so fail explicitly instead.
+			// AIR's pointers are opaque, so the type carries no pointee. A device or constant pointer is a physical
+			// pointer, whose pointee doesn't matter (see physicalPointerType). A pointer into thread or threadgroup
+			// memory names a variable, which a bare type can't.
 			auto addrSpace = DynamicLLVM::LLVMGetPointerAddressSpace(llvmType);
+			if (addrSpace == 1 || addrSpace == 2) {
+				return physicalPointerType(builder);
+			}
 			throw ImpossibleResultID("cannot resolve pointee of opaque pointer (addrspace "
 				+ std::to_string((unsigned)addrSpace) + "); derive it from AIR argument metadata");
 		} break;
@@ -883,10 +894,10 @@ static Iridium::SPIRV::ResultID llvmGEPToResultID(Iridium::SPIRV::Builder& build
 	bool logical = isLogicalStorageClass(origType.pointerStorageClass);
 	LayoutFreeScope layoutFree(logical);
 
-	auto pointeeType = llvmTypeToSPIRVType(builder, currentType);
-
 	// ensure the resulting pointer storage class is the same as the input pointer storage class
-	auto resultType = builder.declareType(SPIRV::Type(SPIRV::Type::PointerTag {}, origType.pointerStorageClass, pointeeType, 8));
+	auto resultType = origType.pointerStorageClass == SPIRV::StorageClass::PhysicalStorageBuffer
+		? physicalPointerType(builder)
+		: builder.declareType(SPIRV::Type(SPIRV::Type::PointerTag {}, origType.pointerStorageClass, llvmTypeToSPIRVType(builder, currentType), 8));
 
 	auto uint64Type = builder.declareType(SPIRV::Type(SPIRV::Type::IntegerTag {}, 64, false));
 
@@ -2694,7 +2705,6 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 					throw ImpossibleResultID("air.buffer descriptor has no air.arg_type_name");
 				}
 				auto typeName = llvmMDStringToStringView(typeNameNode);
-				auto type = spirvTypeForAIRTypeName(builder, _module.get(), typeName);
 				std::string_view base;
 				size_t count = 0;
 				if (typeName.substr(0, 7) == "packed_" && splitMetalTypeName(typeName, base, count) && count == 3) {
@@ -2703,9 +2713,7 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 							std::string(typeName) + " (" + std::to_string(3 * scalar->size) + "-byte elements)");
 					}
 				}
-				auto addrPtrTypeInst = SPIRV::Type(SPIRV::Type::PointerTag {}, SPIRV::StorageClass::PhysicalStorageBuffer, type, 8);
-				auto addrPtrType = builder.declareType(addrPtrTypeInst);
-				bufferMembers.push_back(SPIRV::Type::Member { addrPtrType, 8 * bufferIndex, {} });
+				bufferMembers.push_back(SPIRV::Type::Member { physicalPointerType(builder), 8 * bufferIndex, {} });
 				++bufferIndex;
 			}
 		}
