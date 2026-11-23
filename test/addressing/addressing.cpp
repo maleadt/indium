@@ -101,6 +101,20 @@ int main(int argc, char** argv) {
 		ok = check(device.get(), library, "pointer_phi", in, {}, [&](int32_t i) { return values[i] + values[i + 1] + values[i + 2] + values[i + 3]; }) && ok;
 		ok = check(device.get(), library, "pointer_integer", in, {}, [&](int32_t i) { return values[i + 1]; }) && ok;
 
+		ok = check(device.get(), library, "threadgroup_derived", in, {}, [&](int32_t i) { return values[i + 1]; }) && ok;
+		ok = check(device.get(), library, "private_derived", in, {}, [&](int32_t i) { return values[i + (i & 3)] + values[i + (i & 3) + 1]; }) && ok;
+		ok = check(device.get(), library, "threadgroup_bytes", in, {}, [&](int32_t i) { return values[31 - i]; }) && ok;
+		ok = check(device.get(), library, "threadgroup_subword", in, {}, [&](int32_t i) { return values[31 - i] & 0xff; }) && ok;
+		ok = check(device.get(), library, "threadgroup_phi", in, {},
+			[&](int32_t i) {
+				int32_t sum = 0;
+				for (int32_t k = 0; k < 4 + (i & 3); ++k) {
+					sum += values[i + k];
+				}
+				return i % 2 ? sum : -1;
+			}) && ok;
+		ok = check(device.get(), library, "threadgroup_atomic", in, {}, [&](int32_t i) { return int32_t(threadCount); }) && ok;
+
 		keepPollingDevice = false;
 		device->wakeupEventLoop();
 		devicePollingThread.join();

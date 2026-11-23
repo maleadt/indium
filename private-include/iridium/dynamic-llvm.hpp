@@ -3,6 +3,7 @@
 #include <llvm-c/BitReader.h>
 #include <llvm-c/Core.h>
 #include <llvm-c/Error.h>
+#include <llvm-c/Target.h>
 #include <llvm-c/Transforms/PassBuilder.h>
 
 #include <dlfcn.h>
@@ -153,7 +154,11 @@ namespace Iridium {
 			_macro(LLVMIsFunctionVarArg) \
 			_macro(LLVMRemoveCallSiteEnumAttribute) \
 			_macro(LLVMRemoveEnumAttributeAtIndex) \
-			_macro(LLVMTypeOf)
+			_macro(LLVMTypeOf) \
+			_macro(LLVMGetModuleDataLayout) \
+			_macro(LLVMABISizeOfType) \
+			_macro(LLVMABIAlignmentOfType) \
+			_macro(LLVMOffsetOfElement)
 
 		#define IRIDIUM_DYNAMICLLVM_FUNCTION_DECL(_name) \
 			extern DynamicFunction<decltype(_name)> _name;
