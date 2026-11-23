@@ -63,6 +63,18 @@ static std::shared_ptr<Indium::Buffer> buffer(Indium::Device* device, const std:
 	return device->newBuffer(contents.data(), contents.size() * sizeof(T), Indium::ResourceOptions::StorageModeShared);
 }
 
+// The binary16 encoding of a small integer (exact, so no rounding is involved).
+static uint16_t half(int32_t value) {
+	if (value == 0) {
+		return 0;
+	}
+	uint16_t sign = value < 0 ? 0x8000 : 0;
+	uint32_t magnitude = value < 0 ? -value : value;
+	int exponent = 31 - __builtin_clz(magnitude);
+	uint32_t mantissa = (magnitude << (10 - exponent)) & 0x3ff;
+	return sign | ((exponent + 15) << 10) | mantissa;
+}
+
 static std::vector<int32_t> ramp(size_t count) {
 	std::vector<int32_t> values(count);
 	for (size_t i = 0; i < count; ++i) {
@@ -114,6 +126,15 @@ int main(int argc, char** argv) {
 				return i % 2 ? sum : -1;
 			}) && ok;
 		ok = check(device.get(), library, "threadgroup_atomic", in, {}, [&](int32_t i) { return int32_t(threadCount); }) && ok;
+
+		ok = check(device.get(), library, "threadgroup_punning", in, {}, [&](int32_t i) { return 2 * values[(i + 1) & 31] + values[i]; }) && ok;
+		ok = check(device.get(), library, "threadgroup_mixed_width", in, {},
+			[&](int32_t i) { int k = i & 3; return values[k] + (31 - i) + values[3 - k] + (3 - k); }) && ok;
+		ok = check(device.get(), library, "private_punning", in, {}, [&](int32_t i) {
+			uint16_t a = half(values[i]), b = half(values[i + 1]);
+			return i & 1 ? int32_t(b | uint32_t(a) << 16) : int32_t(a | uint32_t(b) << 16);
+		}) && ok;
+		ok = check(device.get(), library, "threadgroup_dead", in, {}, [&](int32_t i) { return values[i]; }) && ok;
 
 		keepPollingDevice = false;
 		device->wakeupEventLoop();
