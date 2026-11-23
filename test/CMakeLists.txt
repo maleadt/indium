@@ -71,6 +71,7 @@ add_subdirectory(simdgroup)
 add_subdirectory(pipeline-limits)
 add_subdirectory(physical-pointer)
 add_subdirectory(wide-vector-bitcast)
+add_subdirectory(addressing)
 add_subdirectory(pipeline-bench)
 add_subdirectory(pipeline-cache)
 add_subdirectory(quad-functions)
@@ -105,6 +106,8 @@ add_test(NAME physical-gep
 	COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/physical-gep/check.sh" $<TARGET_FILE:indium-test-physical-gep> "${CMAKE_CURRENT_BINARY_DIR}/physical-gep-out")
 add_test(NAME physical-pointer
 	COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/physical-pointer/check.sh" $<TARGET_FILE:mtl2spv> "${CMAKE_CURRENT_BINARY_DIR}/physical-pointer-out")
+add_test(NAME addressing
+	COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/addressing/check.sh" $<TARGET_FILE:mtl2spv> "${CMAKE_CURRENT_BINARY_DIR}/addressing-out")
 add_iridium_check(indium-test-vector-types vector-layout/vector-types.cpp)
 add_test(NAME vector-types COMMAND indium-test-vector-types)
 # built so a Type constructor change cannot silently break it; its spirv-val step is manual
