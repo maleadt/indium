@@ -252,6 +252,131 @@ count:
   ret void
 }
 
+@mixed = internal addrspace(3) global [256 x i8] undef, align 4
+
+; one byte pool holding floats at offset 0 and ints at offset 128, as Metal.jl lays out a struct
+; of arrays: out[id] = 2 * in[(id + 1) & 31] + in[id]
+define void @threadgroup_punning(ptr addrspace(1) %out, ptr addrspace(1) %in, i32 %id) #0 {
+  %i = zext i32 %id to i64
+  %a = getelementptr inbounds i32, ptr addrspace(1) %in, i64 %i
+  %v = load i32, ptr addrspace(1) %a, align 4
+  %f = sitofp i32 %v to float
+  %fp = getelementptr inbounds float, ptr addrspace(3) @mixed, i64 %i
+  store float %f, ptr addrspace(3) %fp, align 4
+  %ints = getelementptr inbounds i8, ptr addrspace(3) @mixed, i64 128
+  %ip = getelementptr inbounds i32, ptr addrspace(3) %ints, i64 %i
+  store i32 %v, ptr addrspace(3) %ip, align 4
+  call void @air.wg.barrier(i32 2, i32 1)
+  %n = add i32 %id, 1
+  %n31 = and i32 %n, 31
+  %j = zext i32 %n31 to i64
+  %gp = getelementptr inbounds float, ptr addrspace(3) @mixed, i64 %j
+  %g = load float, ptr addrspace(3) %gp, align 4
+  %gi = fptosi float %g to i32
+  %w = load i32, ptr addrspace(3) %ip, align 4
+  %twice = shl i32 %gi, 1
+  %r = add i32 %twice, %w
+  %o = getelementptr inbounds i32, ptr addrspace(1) %out, i64 %i
+  store i32 %r, ptr addrspace(1) %o, align 4
+  ret void
+}
+
+@union = internal addrspace(3) global [128 x i8] undef, align 8
+
+; longs, byte tags and { int, char } structs in one pool, as Julia lays out a union: threads 0-3
+; write long[id] = in[id] << 32 | id and struct[id] = { in[id], id } (8 bytes from offset 64), every
+; thread writes tag[id] = id at offset 32; out[id] = in[k] + (31 - id) + in[3 - k] + (3 - k), k = id & 3
+define void @threadgroup_mixed_width(ptr addrspace(1) %out, ptr addrspace(1) %in, i32 %id) #0 {
+entry:
+  %i = zext i32 %id to i64
+  %a = getelementptr inbounds i32, ptr addrspace(1) %in, i64 %i
+  %v = load i32, ptr addrspace(1) %a, align 4
+  %low = icmp ult i32 %id, 4
+  br i1 %low, label %wide, label %tags
+
+wide:
+  %v64 = zext i32 %v to i64
+  %hi = shl i64 %v64, 32
+  %long = or i64 %hi, %i
+  %lp = getelementptr inbounds i64, ptr addrspace(3) @union, i64 %i
+  store i64 %long, ptr addrspace(3) %lp, align 8
+  %t8 = trunc i32 %id to i8
+  %s0 = insertvalue { i32, i8 } undef, i32 %v, 0
+  %s1 = insertvalue { i32, i8 } %s0, i8 %t8, 1
+  %sp = getelementptr inbounds { i32, i8 }, ptr addrspace(3) getelementptr inbounds (i8, ptr addrspace(3) @union, i64 64), i64 %i
+  store { i32, i8 } %s1, ptr addrspace(3) %sp, align 4
+  br label %tags
+
+tags:
+  %tag = trunc i32 %id to i8
+  %tp = getelementptr inbounds i8, ptr addrspace(3) getelementptr inbounds (i8, ptr addrspace(3) @union, i64 32), i64 %i
+  store i8 %tag, ptr addrspace(3) %tp, align 1
+  call void @air.wg.barrier(i32 2, i32 1)
+  %k = and i64 %i, 3
+  %lq = getelementptr inbounds i64, ptr addrspace(3) @union, i64 %k
+  %l = load i64, ptr addrspace(3) %lq, align 8
+  %lhi = lshr i64 %l, 32
+  %A = trunc i64 %lhi to i32
+  %r = sub i64 31, %i
+  %tq = getelementptr inbounds i8, ptr addrspace(3) getelementptr inbounds (i8, ptr addrspace(3) @union, i64 32), i64 %r
+  %tv = load i8, ptr addrspace(3) %tq, align 1
+  %B = zext i8 %tv to i32
+  %m = sub i64 3, %k
+  %sq = getelementptr inbounds { i32, i8 }, ptr addrspace(3) getelementptr inbounds (i8, ptr addrspace(3) @union, i64 64), i64 %m
+  %sv = load { i32, i8 }, ptr addrspace(3) %sq, align 4
+  %C = extractvalue { i32, i8 } %sv, 0
+  %d8 = extractvalue { i32, i8 } %sv, 1
+  %D = zext i8 %d8 to i32
+  %AB = add i32 %A, %B
+  %CD = add i32 %C, %D
+  %res = add i32 %AB, %CD
+  %o = getelementptr inbounds i32, ptr addrspace(1) %out, i64 %i
+  store i32 %res, ptr addrspace(1) %o, align 4
+  ret void
+}
+
+; two halves read as one int, as Julia reads a struct of two Float16s (k = id & 1):
+; t[k] = half(in[id]), t[1 - k] = half(in[id + 1]); out[id] = bits of t[0] | bits of t[1] << 16
+define void @private_punning(ptr addrspace(1) %out, ptr addrspace(1) %in, i32 %id) #0 {
+  %t = alloca [2 x half], align 2
+  %i = zext i32 %id to i64
+  %a = getelementptr inbounds i32, ptr addrspace(1) %in, i64 %i
+  %va = load i32, ptr addrspace(1) %a, align 4
+  %i1 = add i64 %i, 1
+  %b = getelementptr inbounds i32, ptr addrspace(1) %in, i64 %i1
+  %vb = load i32, ptr addrspace(1) %b, align 4
+  %ha = sitofp i32 %va to half
+  %hb = sitofp i32 %vb to half
+  %k = and i64 %i, 1
+  %nk = xor i64 %k, 1
+  %pa = getelementptr inbounds half, ptr %t, i64 %k
+  store half %ha, ptr %pa, align 2
+  %pb = getelementptr inbounds half, ptr %t, i64 %nk
+  store half %hb, ptr %pb, align 2
+  %bits = load i32, ptr %t, align 2
+  %o = getelementptr inbounds i32, ptr addrspace(1) %out, i64 %i
+  store i32 %bits, ptr addrspace(1) %o, align 4
+  ret void
+}
+
+@scratch = internal addrspace(3) global [16 x i8] undef, align 4
+@copy = internal addrspace(3) global [16 x i8] undef, align 4
+
+; threadgroup memory that is written and copied but never read: out[id] = in[id]
+define void @threadgroup_dead(ptr addrspace(1) %out, ptr addrspace(1) %in, i32 %id) #0 {
+  %i = zext i32 %id to i64
+  %a = getelementptr inbounds i32, ptr addrspace(1) %in, i64 %i
+  %v = load i32, ptr addrspace(1) %a, align 4
+  %k = and i64 %i, 3
+  %p = getelementptr inbounds i32, ptr addrspace(3) @scratch, i64 %k
+  store i32 %v, ptr addrspace(3) %p, align 4
+  call void @llvm.memcpy.p3.p3.i64(ptr addrspace(3) align 4 @copy, ptr addrspace(3) align 4 @scratch, i64 16, i1 false)
+  %o = getelementptr inbounds i32, ptr addrspace(1) %out, i64 %i
+  store i32 %v, ptr addrspace(1) %o, align 4
+  ret void
+}
+
+declare void @llvm.memcpy.p3.p3.i64(ptr addrspace(3) noalias nocapture writeonly, ptr addrspace(3) noalias nocapture readonly, i64, i1 immarg) #1
 declare void @air.wg.barrier(i32, i32) #1
 declare i32 @air.atomic.local.add.s.i32(ptr addrspace(3), i32, i32, i32, i1) #1
 
@@ -261,7 +386,7 @@ attributes #0 = { nounwind }
 !llvm.module.flags = !{!0}
 !air.version = !{!1}
 !air.language_version = !{!2}
-!air.kernel = !{!10, !20, !30, !31, !32, !40, !41, !42, !43, !44, !45}
+!air.kernel = !{!10, !20, !30, !31, !32, !40, !41, !42, !43, !44, !45, !46, !47, !48, !49}
 
 !0 = !{i32 1, !"wchar_size", i32 4}
 !1 = !{i32 2, i32 2, i32 0}
@@ -289,3 +414,7 @@ attributes #0 = { nounwind }
 !43 = !{ptr @threadgroup_subword, !3, !7}
 !44 = !{ptr @threadgroup_phi, !3, !7}
 !45 = !{ptr @threadgroup_atomic, !3, !7}
+!46 = !{ptr @threadgroup_punning, !3, !7}
+!47 = !{ptr @threadgroup_mixed_width, !3, !7}
+!48 = !{ptr @private_punning, !3, !7}
+!49 = !{ptr @threadgroup_dead, !3, !7}

@@ -1016,6 +1016,8 @@ static Iridium::SPIRV::ResultID descendToFirstElement(Iridium::SPIRV::Builder& b
 	return access;
 }
 
+static Iridium::SPIRV::ResultID integerConstantOfType(Iridium::SPIRV::Builder& builder, Iridium::SPIRV::ResultID typeID, int64_t value);
+
 // Thread, threadgroup and constant memory addressed by byte offset.
 //
 // A local variable (an alloca, a threadgroup global or a program-scope constant) is declared as a SPIR-V variable of
@@ -1039,10 +1041,13 @@ public:
 	struct Root {
 		LLVMValueRef value = nullptr;
 		LLVMTypeRef declaredType = nullptr;
-		// the type of every access, its size, and how many of them the variable holds
+		// never read, so not declared, and written to by nothing
+		bool dead = false;
+		// the type the variable is an array of: elementType, or an unsigned integer of elementSize bytes when it's null
 		LLVMTypeRef elementType = nullptr;
 		uint64_t elementSize = 0;
 		uint64_t count = 0;
+		Iridium::SPIRV::ResultID element = Iridium::SPIRV::ResultIDInvalid;
 		Iridium::SPIRV::StorageClass storageClass = Iridium::SPIRV::StorageClass::Function;
 		Iridium::SPIRV::ResultID variable = Iridium::SPIRV::ResultIDInvalid;
 		Iridium::SPIRV::ResultID elementPointerType = Iridium::SPIRV::ResultIDInvalid;
@@ -1085,6 +1090,9 @@ public:
 	Iridium::SPIRV::ResultID define(LLVMValueRef inst, const Offset& offset);
 	// A pointer to the element that an access at `offset` reads or writes.
 	Iridium::SPIRV::ResultID elementPointer(Root& root, const Offset& offset);
+	// Loads or stores a value of `type` at `offset`, as whole elements.
+	Iridium::SPIRV::ResultID load(Root& root, const Offset& offset, LLVMTypeRef type);
+	void store(Root& root, const Offset& offset, LLVMTypeRef type, Iridium::SPIRV::ResultID value);
 
 private:
 	static bool isPointer(LLVMValueRef value) {
@@ -1101,6 +1109,16 @@ private:
 	LLVMTypeRef typedPointee(LLVMValueRef pointer, LLVMValueRef root);
 	Iridium::SPIRV::ResultID indexToOffset(LLVMValueRef index);
 	void declare(Root& root);
+	void scalars(LLVMTypeRef type, uint64_t offset, std::vector<std::pair<LLVMTypeRef, uint64_t>>& out);
+	template<typename Accesses>
+	void chooseElement(Root& info, LLVMTypeRef first, uint64_t rootAlignment, Accesses&& accesses);
+	Iridium::SPIRV::ResultID unsignedType(uint64_t bytes) {
+		return _builder.declareType(Iridium::SPIRV::Type(Iridium::SPIRV::Type::IntegerTag {}, 8 * bytes, false));
+	}
+	static Offset plus(Offset offset, uint64_t bytes) {
+		offset.constant += bytes;
+		return offset;
+	}
 
 	Iridium::SPIRV::Builder& _builder;
 	LLVMTargetDataRef _layout;
@@ -1199,13 +1217,17 @@ void LocalMemory::analyze(const std::vector<LLVMValueRef>& instructions) {
 		LLVMValueRef pointer;
 		LLVMTypeRef type;
 		uint64_t alignment;
+		bool reads;
+		bool atomic;
 	};
 	std::unordered_map<LLVMValueRef, std::vector<Access>> accesses;
 	std::unordered_set<LLVMValueRef> escaped, offsetOnly;
-	auto access = [&](LLVMValueRef pointer, LLVMTypeRef type, uint64_t alignment) {
+	// memcpy, memmove and memset calls into a variable, with their source variable (or null)
+	std::vector<std::pair<LLVMValueRef, LLVMValueRef>> copies;
+	auto access = [&](LLVMValueRef pointer, LLVMTypeRef type, uint64_t alignment, bool reads, bool atomic = false) {
 		auto root = rootValue(pointer);
 		if (isVariable(root)) {
-			accesses[root].push_back(Access { pointer, type, alignment ? alignment : DynamicLLVM::LLVMABIAlignmentOfType(_layout, type) });
+			accesses[root].push_back(Access { pointer, type, alignment ? alignment : DynamicLLVM::LLVMABIAlignmentOfType(_layout, type), reads, atomic });
 		}
 	};
 	auto escape = [&](LLVMValueRef value) {
@@ -1222,12 +1244,12 @@ void LocalMemory::analyze(const std::vector<LLVMValueRef>& instructions) {
 		auto operands = DynamicLLVM::LLVMGetNumOperands(inst);
 		switch (opcode) {
 			case LLVMLoad:
-				access(DynamicLLVM::LLVMGetOperand(inst, 0), DynamicLLVM::LLVMTypeOf(inst), DynamicLLVM::LLVMGetAlignment(inst));
+				access(DynamicLLVM::LLVMGetOperand(inst, 0), DynamicLLVM::LLVMTypeOf(inst), DynamicLLVM::LLVMGetAlignment(inst), true);
 				break;
 
 			case LLVMStore:
 				escape(DynamicLLVM::LLVMGetOperand(inst, 0));
-				access(DynamicLLVM::LLVMGetOperand(inst, 1), DynamicLLVM::LLVMTypeOf(DynamicLLVM::LLVMGetOperand(inst, 0)), DynamicLLVM::LLVMGetAlignment(inst));
+				access(DynamicLLVM::LLVMGetOperand(inst, 1), DynamicLLVM::LLVMTypeOf(DynamicLLVM::LLVMGetOperand(inst, 0)), DynamicLLVM::LLVMGetAlignment(inst), false);
 				break;
 
 			case LLVMGetElementPtr:
@@ -1271,10 +1293,21 @@ void LocalMemory::analyze(const std::vector<LLVMValueRef>& instructions) {
 					if (DynamicLLVM::LLVMGetTypeKind(type) == LLVMVoidTypeKind) {
 						type = DynamicLLVM::LLVMTypeOf(DynamicLLVM::LLVMGetOperand(inst, 1));
 					}
-					access(DynamicLLVM::LLVMGetOperand(inst, 0), type, 0);
+					access(DynamicLLVM::LLVMGetOperand(inst, 0), type, 0, true, true);
 					if (name.find(".cmpxchg.") != name.npos && isPointer(DynamicLLVM::LLVMGetOperand(inst, 1))) {
 						// compare-and-exchange reads and writes the expected value through its second argument
-						access(DynamicLLVM::LLVMGetOperand(inst, 1), type, 0);
+						access(DynamicLLVM::LLVMGetOperand(inst, 1), type, 0, true);
+					}
+					break;
+				}
+				if ((name.substr(0, 12) == "llvm.memcpy." || name.substr(0, 13) == "llvm.memmove." || name.substr(0, 12) == "llvm.memset.") && arguments >= 3) {
+					auto destination = rootValue(DynamicLLVM::LLVMGetOperand(inst, 0));
+					auto source = name.substr(0, 12) == "llvm.memset." ? nullptr : rootValue(DynamicLLVM::LLVMGetOperand(inst, 1));
+					if (isVariable(destination)) {
+						copies.emplace_back(destination, isVariable(source) ? source : nullptr);
+					} else {
+						// a copy out of local memory reads it in a way only a dead variable allows (see below)
+						escape(DynamicLLVM::LLVMGetOperand(inst, 1));
 					}
 					break;
 				}
@@ -1291,6 +1324,39 @@ void LocalMemory::analyze(const std::vector<LLVMValueRef>& instructions) {
 		}
 	}
 
+	// A variable that is never read only needs its writes dropped, including the copies into it, which also stop
+	// reading their sources (Julia leaves padding allocas that are only ever copied into each other).
+	std::unordered_set<LLVMValueRef> dead;
+	for (auto& [inst, root]: _derived) {
+		if (isVariable(root)) {
+			dead.insert(root);
+		}
+	}
+	for (auto& [root, list]: accesses) {
+		dead.insert(root);
+	}
+	for (auto& [destination, source]: copies) {
+		dead.insert(destination);
+	}
+	for (auto& [root, list]: accesses) {
+		for (auto& access: list) {
+			if (access.reads) {
+				dead.erase(root);
+			}
+		}
+	}
+	for (auto root: escaped) {
+		dead.erase(root);
+	}
+	for (bool changed = true; changed;) {
+		changed = false;
+		for (auto& [destination, source]: copies) {
+			if (source && !dead.count(destination) && dead.erase(source)) {
+				changed = true;
+			}
+		}
+	}
+
 	// A variable joins the byte-offset path when the access-chain translation can't handle it.
 	std::unordered_set<LLVMValueRef> variables;
 	for (auto& [inst, root]: _derived) {
@@ -1301,7 +1367,20 @@ void LocalMemory::analyze(const std::vector<LLVMValueRef>& instructions) {
 	for (auto& [root, list]: accesses) {
 		variables.insert(root);
 	}
+	for (auto& [destination, source]: copies) {
+		variables.insert(destination);
+		if (source) {
+			variables.insert(source);
+		}
+	}
 	for (auto root: variables) {
+		Root info;
+		info.value = root;
+		bool alloca = DynamicLLVM::LLVMGetValueKind(root) != LLVMGlobalVariableValueKind;
+		info.declaredType = alloca ? DynamicLLVM::LLVMGetAllocatedType(root) : DynamicLLVM::LLVMGlobalGetValueType(root);
+		info.storageClass = alloca ? Iridium::SPIRV::StorageClass::Function
+			: DynamicLLVM::LLVMGetPointerAddressSpace(DynamicLLVM::LLVMTypeOf(root)) == 3 ? Iridium::SPIRV::StorageClass::Workgroup
+			: Iridium::SPIRV::StorageClass::Private;
 		bool typed = !offsetOnly.count(root);
 		for (auto& [inst, derivedRoot]: _derived) {
 			if (derivedRoot == root && !typedPointee(inst, root)) {
@@ -1319,46 +1398,42 @@ void LocalMemory::analyze(const std::vector<LLVMValueRef>& instructions) {
 			}
 			typed = typed && pointee;
 		}
+		for (auto& [destination, source]: copies) {
+			if (destination == root || source == root) {
+				typed = false;
+			}
+		}
 		if (typed) {
+			continue;
+		}
+		if (dead.count(root) && info.storageClass != Iridium::SPIRV::StorageClass::Private) {
+			info.dead = true;
+			_roots.emplace(root, info);
 			continue;
 		}
 		if (escaped.count(root)) {
 			throw ImpossibleResultID("the address of " + valueName(root) + " escapes: it is stored, passed to a function, converted to an integer, "
 				"or may point into another variable");
 		}
-
-		Root info;
-		info.value = root;
-		bool alloca = DynamicLLVM::LLVMGetValueKind(root) != LLVMGlobalVariableValueKind;
-		info.declaredType = alloca ? DynamicLLVM::LLVMGetAllocatedType(root) : DynamicLLVM::LLVMGlobalGetValueType(root);
-		info.storageClass = alloca ? Iridium::SPIRV::StorageClass::Function
-			: DynamicLLVM::LLVMGetPointerAddressSpace(DynamicLLVM::LLVMTypeOf(root)) == 3 ? Iridium::SPIRV::StorageClass::Workgroup
-			: Iridium::SPIRV::StorageClass::Private;
-		uint64_t alignment = DynamicLLVM::LLVMGetAlignment(root);
-		if (!alignment) {
-			alignment = DynamicLLVM::LLVMABIAlignmentOfType(_layout, info.declaredType);
+		for (auto& [destination, source]: copies) {
+			if (destination == root) {
+				throw ImpossibleResultID("memcpy, memmove or memset into " + valueName(root) + ", which is read");
+			}
 		}
 
 		auto& list = accesses[root];
 		if (list.empty()) {
 			throw ImpossibleResultID(valueName(root) + " is addressed but never accessed");
 		}
-		info.elementType = list.front().type;
-		auto kind = DynamicLLVM::LLVMGetTypeKind(info.elementType);
-		auto scalar = kind == LLVMVectorTypeKind ? DynamicLLVM::LLVMGetElementType(info.elementType) : info.elementType;
-		auto scalarKind = DynamicLLVM::LLVMGetTypeKind(scalar);
-		bool supported = scalarKind == LLVMHalfTypeKind || scalarKind == LLVMFloatTypeKind || scalarKind == LLVMDoubleTypeKind
-			|| (scalarKind == LLVMIntegerTypeKind && DynamicLLVM::LLVMGetIntTypeWidth(scalar) >= 8);
-		if (kind == LLVMVectorTypeKind && DynamicLLVM::LLVMGetVectorSize(info.elementType) != 2 && DynamicLLVM::LLVMGetVectorSize(info.elementType) != 4) {
-			supported = false;
+		uint64_t alignment = DynamicLLVM::LLVMGetAlignment(root);
+		if (!alignment) {
+			alignment = DynamicLLVM::LLVMABIAlignmentOfType(_layout, info.declaredType);
 		}
-		info.elementSize = DynamicLLVM::LLVMABISizeOfType(_layout, info.elementType);
-		for (auto& access: list) {
-			supported = supported && access.type == info.elementType && access.alignment >= info.elementSize;
-		}
-		if (!supported || alignment < info.elementSize) {
-			throw ImpossibleResultID(valueName(root) + " is accessed as several types, or at offsets not aligned to its type");
-		}
+		chooseElement(info, list.front().type, alignment, [&](auto&& visit) {
+			for (auto& access: list) {
+				visit(access.type, access.alignment, access.atomic);
+			}
+		});
 		auto size = DynamicLLVM::LLVMABISizeOfType(_layout, info.declaredType);
 		info.count = (size + info.elementSize - 1) / info.elementSize;
 
@@ -1375,6 +1450,101 @@ void LocalMemory::analyze(const std::vector<LLVMValueRef>& instructions) {
 
 		_roots.emplace(root, info);
 	}
+}
+
+// The scalars a value of `type` consists of, with their byte offsets in it, in order.
+void LocalMemory::scalars(LLVMTypeRef type, uint64_t offset, std::vector<std::pair<LLVMTypeRef, uint64_t>>& out) {
+	switch (DynamicLLVM::LLVMGetTypeKind(type)) {
+		case LLVMStructTypeKind:
+			for (unsigned i = 0; i < DynamicLLVM::LLVMCountStructElementTypes(type); ++i) {
+				scalars(DynamicLLVM::LLVMStructGetTypeAtIndex(type, i), offset + DynamicLLVM::LLVMOffsetOfElement(_layout, type, i), out);
+			}
+			break;
+		case LLVMArrayTypeKind:
+		case LLVMVectorTypeKind: {
+			auto element = DynamicLLVM::LLVMGetElementType(type);
+			auto count = DynamicLLVM::LLVMGetTypeKind(type) == LLVMArrayTypeKind ? DynamicLLVM::LLVMGetArrayLength(type) : DynamicLLVM::LLVMGetVectorSize(type);
+			for (uint64_t i = 0; i < count; ++i) {
+				scalars(element, offset + i * DynamicLLVM::LLVMABISizeOfType(_layout, element), out);
+			}
+		} break;
+		default:
+			out.emplace_back(type, offset);
+			break;
+	}
+}
+
+// Picks the element type of a variable from its accesses (see DESIGN): the one type all accesses have, if each is
+// aligned to it; else an unsigned integer as wide as the narrowest scalar or alignment among them, so that every
+// access reads and writes whole elements.
+template<typename Accesses>
+void LocalMemory::chooseElement(Root& info, LLVMTypeRef first, uint64_t rootAlignment, Accesses&& accesses) {
+	auto fail = [&](const std::string& why) {
+		throw ImpossibleResultID(valueName(info.value) + " " + why);
+	};
+	auto isSupportedScalar = [](LLVMTypeRef scalar) {
+		auto kind = DynamicLLVM::LLVMGetTypeKind(scalar);
+		return kind == LLVMHalfTypeKind || kind == LLVMFloatTypeKind || kind == LLVMDoubleTypeKind
+			|| (kind == LLVMIntegerTypeKind && DynamicLLVM::LLVMGetIntTypeWidth(scalar) >= 8);
+	};
+
+	// one type, aligned to its size, possibly a vector
+	bool same = true;
+	auto firstKind = DynamicLLVM::LLVMGetTypeKind(first);
+	bool usable = firstKind == LLVMVectorTypeKind
+		? (DynamicLLVM::LLVMGetVectorSize(first) == 2 || DynamicLLVM::LLVMGetVectorSize(first) == 4) && isSupportedScalar(DynamicLLVM::LLVMGetElementType(first))
+		: isSupportedScalar(first);
+	auto firstSize = DynamicLLVM::LLVMABISizeOfType(_layout, first);
+	accesses([&](LLVMTypeRef type, uint64_t alignment, bool atomic) {
+		same = same && type == first && alignment >= firstSize;
+	});
+	if (same && usable && rootAlignment >= firstSize) {
+		info.elementType = first;
+		info.elementSize = firstSize;
+		return;
+	}
+
+	// whole elements of the narrowest width
+	uint64_t width = rootAlignment;
+	LLVMTypeRef atomicType = nullptr;
+	LLVMTypeRef onlyScalar = nullptr;
+	bool oneScalar = true;
+	accesses([&](LLVMTypeRef type, uint64_t alignment, bool atomic) {
+		std::vector<std::pair<LLVMTypeRef, uint64_t>> parts;
+		scalars(type, 0, parts);
+		for (auto& [scalar, offset]: parts) {
+			if (!isSupportedScalar(scalar)) {
+				fail("is accessed as a type that local memory can't hold");
+			}
+			auto size = DynamicLLVM::LLVMABISizeOfType(_layout, scalar);
+			// the part's address is aligned to the access's alignment and to its offset in the access
+			auto partAlignment = offset ? std::min<uint64_t>(alignment, offset & -offset) : alignment;
+			width = std::min(width, std::min<uint64_t>(size, partAlignment));
+			oneScalar = oneScalar && (!onlyScalar || onlyScalar == scalar);
+			onlyScalar = scalar;
+		}
+		if (atomic) {
+			if (atomicType && atomicType != type) {
+				fail("is accessed by atomics of different types");
+			}
+			atomicType = type;
+		}
+	});
+	if (width != 1 && width != 2 && width != 4 && width != 8) {
+		fail("is accessed at offsets aligned to " + std::to_string(width) + " bytes");
+	}
+	if (atomicType) {
+		// an atomic needs an element of its own type
+		if (DynamicLLVM::LLVMABISizeOfType(_layout, atomicType) != width) {
+			fail("has atomics as well as accesses narrower than them, or less aligned");
+		}
+		info.elementType = atomicType;
+	} else if (oneScalar && DynamicLLVM::LLVMABISizeOfType(_layout, onlyScalar) == width) {
+		info.elementType = onlyScalar;
+	} else {
+		info.elementType = nullptr;
+	}
+	info.elementSize = width;
 }
 
 LLVMTypeRef LocalMemory::typedPointee(LLVMValueRef pointer, LLVMValueRef root) {
@@ -1509,7 +1679,8 @@ Iridium::SPIRV::ResultID LocalMemory::define(LLVMValueRef inst, const Offset& of
 void LocalMemory::declare(Root& root) {
 	using namespace Iridium::SPIRV;
 	LayoutFreeScope layoutFree(true);
-	auto element = llvmTypeToSPIRVType(_builder, root.elementType);
+	auto element = root.elementType ? llvmTypeToSPIRVType(_builder, root.elementType) : unsignedType(root.elementSize);
+	root.element = element;
 	auto elementInfo = *_builder.reverseLookupType(element);
 	Type arrayType(Type::ArrayTag {}, element, root.count, root.count * elementInfo.size, elementInfo.alignment);
 	arrayType.layoutFree = true;
@@ -1560,6 +1731,97 @@ Iridium::SPIRV::ResultID LocalMemory::elementPointer(Root& root, const Offset& o
 	auto pointer = _builder.encodeAccessChain(root.elementPointerType, root.variable, { index });
 	_builder.setResultType(pointer, root.elementPointerType);
 	return pointer;
+}
+
+Iridium::SPIRV::ResultID LocalMemory::load(Root& root, const Offset& offset, LLVMTypeRef type) {
+	using namespace Iridium::SPIRV;
+	auto pointer = elementPointer(root, offset);
+	auto typeID = llvmTypeToSPIRVType(_builder, type);
+	if (type == root.elementType) {
+		return _builder.encodeLoad(typeID, pointer);
+	}
+
+	auto kind = DynamicLLVM::LLVMGetTypeKind(type);
+	if (kind == LLVMStructTypeKind || kind == LLVMArrayTypeKind || kind == LLVMVectorTypeKind) {
+		std::vector<uint32_t> parts;
+		if (kind == LLVMStructTypeKind) {
+			for (unsigned i = 0; i < DynamicLLVM::LLVMCountStructElementTypes(type); ++i) {
+				parts.push_back(load(root, plus(offset, DynamicLLVM::LLVMOffsetOfElement(_layout, type, i)), DynamicLLVM::LLVMStructGetTypeAtIndex(type, i)));
+			}
+		} else {
+			auto element = DynamicLLVM::LLVMGetElementType(type);
+			auto count = kind == LLVMArrayTypeKind ? DynamicLLVM::LLVMGetArrayLength(type) : DynamicLLVM::LLVMGetVectorSize(type);
+			for (uint64_t i = 0; i < count; ++i) {
+				parts.push_back(load(root, plus(offset, i * DynamicLLVM::LLVMABISizeOfType(_layout, element)), element));
+			}
+		}
+		return _builder.encodeOp(Opcode::CompositeConstruct, typeID, parts);
+	}
+
+	// a scalar of one or more elements, the first at the lowest address
+	auto size = DynamicLLVM::LLVMABISizeOfType(_layout, type);
+	auto first = _builder.encodeLoad(root.element, pointer);
+	if (size == root.elementSize) {
+		return _builder.encodeBitcast(typeID, first);
+	}
+	auto wide = unsignedType(size);
+	auto bits = unsignedType(root.elementSize);
+	auto widen = [&](ResultID element) {
+		return _builder.encodeUConvert(wide, root.element == bits ? element : _builder.encodeBitcast(bits, element));
+	};
+	ResultID value = widen(first);
+	for (uint64_t i = 1; i < size / root.elementSize; ++i) {
+		auto part = widen(_builder.encodeLoad(root.element, elementPointer(root, plus(offset, i * root.elementSize))));
+		auto shift = integerConstantOfType(_builder, wide, 8 * root.elementSize * i);
+		part = _builder.encodeArithBinop(Opcode::ShiftLeftLogical, wide, part, shift);
+		value = _builder.encodeArithBinop(Opcode::BitwiseOr, wide, value, part);
+	}
+	return _builder.encodeBitcast(typeID, value);
+}
+
+void LocalMemory::store(Root& root, const Offset& offset, LLVMTypeRef type, Iridium::SPIRV::ResultID value) {
+	using namespace Iridium::SPIRV;
+	if (root.variable == ResultIDInvalid) {
+		declare(root);
+	}
+	if (type == root.elementType) {
+		_builder.encodeStore(elementPointer(root, offset), value);
+		return;
+	}
+
+	auto kind = DynamicLLVM::LLVMGetTypeKind(type);
+	if (kind == LLVMStructTypeKind || kind == LLVMArrayTypeKind || kind == LLVMVectorTypeKind) {
+		auto part = [&](uint32_t i, LLVMTypeRef partType, uint64_t partOffset) {
+			auto extracted = _builder.encodeCompositeExtract(llvmTypeToSPIRVType(_builder, partType), value, { i });
+			store(root, plus(offset, partOffset), partType, extracted);
+		};
+		if (kind == LLVMStructTypeKind) {
+			for (unsigned i = 0; i < DynamicLLVM::LLVMCountStructElementTypes(type); ++i) {
+				part(i, DynamicLLVM::LLVMStructGetTypeAtIndex(type, i), DynamicLLVM::LLVMOffsetOfElement(_layout, type, i));
+			}
+		} else {
+			auto element = DynamicLLVM::LLVMGetElementType(type);
+			auto count = kind == LLVMArrayTypeKind ? DynamicLLVM::LLVMGetArrayLength(type) : DynamicLLVM::LLVMGetVectorSize(type);
+			for (uint64_t i = 0; i < count; ++i) {
+				part(i, element, i * DynamicLLVM::LLVMABISizeOfType(_layout, element));
+			}
+		}
+		return;
+	}
+
+	auto size = DynamicLLVM::LLVMABISizeOfType(_layout, type);
+	if (size == root.elementSize) {
+		_builder.encodeStore(elementPointer(root, offset), _builder.encodeBitcast(root.element, value));
+		return;
+	}
+	auto wide = unsignedType(size);
+	auto bits = unsignedType(root.elementSize);
+	auto whole = _builder.encodeBitcast(wide, value);
+	for (uint64_t i = 0; i < size / root.elementSize; ++i) {
+		auto part = i == 0 ? whole : _builder.encodeArithBinop(Opcode::ShiftRightLogical, wide, whole, integerConstantOfType(_builder, wide, 8 * root.elementSize * i));
+		part = _builder.encodeUConvert(bits, part);
+		_builder.encodeStore(elementPointer(root, plus(offset, i * root.elementSize)), root.element == bits ? part : _builder.encodeBitcast(root.element, part));
+	}
 }
 
 // Translates the AIR atomic functions of 32-bit and 64-bit integers and of 32-bit floats,
@@ -4283,8 +4545,9 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 				//       (since i *think* that's the same addressing mode used by Metal code)
 
 				case LLVMGetElementPtr: {
-					if (local.rootOf(inst)) {
-						local.define(inst, local.getelementptr(inst));
+					if (auto root = local.rootOf(inst)) {
+						// nothing reads through a pointer into a dead variable
+						local.define(inst, root->dead ? LocalMemory::Offset {} : local.getelementptr(inst));
 						break;
 					}
 					// Metal declares packed_T3 elements as 3 * sizeof(T) bytes, while a 3-lane vector,
@@ -4312,9 +4575,8 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 					auto ptr = DynamicLLVM::LLVMGetOperand(inst, 0);
 					auto targetType = DynamicLLVM::LLVMTypeOf(inst);
 					if (auto root = local.rootOf(ptr)) {
-						LayoutFreeScope layoutFree(true);
 						auto type = llvmTypeToSPIRVType(builder, targetType);
-						auto resID = builder.encodeLoad(type, local.elementPointer(*root, local.offsetOf(ptr)));
+						auto resID = local.load(*root, local.offsetOf(ptr), targetType);
 						builder.associateExistingResultID(resID, reinterpret_cast<uintptr_t>(inst));
 						builder.setResultType(resID, type);
 						break;
@@ -4392,7 +4654,9 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 					auto llptr = DynamicLLVM::LLVMGetOperand(inst, 1);
 					auto val = llvmValueToResultID(builder, llval);
 					if (auto root = local.rootOf(llptr)) {
-						builder.encodeStore(local.elementPointer(*root, local.offsetOf(llptr)), val);
+						if (!root->dead) {
+							local.store(*root, local.offsetOf(llptr), DynamicLLVM::LLVMTypeOf(llval), val);
+						}
 						break;
 					}
 					auto ptr = llvmValueToResultID(builder, llptr);
@@ -4456,6 +4720,13 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 					if (name.substr(0, 14) == "llvm.lifetime.") {
 						// the lifetime markers of local variables carry nothing SPIR-V needs
 						break;
+					}
+					if (name.substr(0, 12) == "llvm.memcpy." || name.substr(0, 13) == "llvm.memmove." || name.substr(0, 12) == "llvm.memset.") {
+						// a copy into a variable that is never read (the analysis refuses any other into local memory)
+						auto root = local.rootOf(DynamicLLVM::LLVMGetOperand(inst, 0));
+						if (root && root->dead) {
+							break;
+						}
 					}
 
 					if (name == "air.get_read_sampler") {
