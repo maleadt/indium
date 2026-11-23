@@ -376,6 +376,82 @@ define void @threadgroup_dead(ptr addrspace(1) %out, ptr addrspace(1) %in, i32 %
   ret void
 }
 
+; a pointer that may point into either of two private arrays, chosen by a phi, as Julia's mul!
+; does with two structs: a[k] = in[id + k], b[k] = in[id + k + 8]; p = id odd ? a : b;
+; out[id] = p[id & 3] + (p == a ? 1000 : 0)
+define void @private_merged(ptr addrspace(1) %out, ptr addrspace(1) %in, i32 %id) #0 {
+entry:
+  %a = alloca [4 x i32], align 4
+  %b = alloca [4 x i32], align 4
+  %i = zext i32 %id to i64
+  %src = getelementptr inbounds i32, ptr addrspace(1) %in, i64 %i
+  br label %fill
+
+fill:
+  %j = phi i64 [ 0, %entry ], [ %j1, %fill ]
+  %sa = getelementptr inbounds i32, ptr addrspace(1) %src, i64 %j
+  %va = load i32, ptr addrspace(1) %sa, align 4
+  %j8 = add i64 %j, 8
+  %sb = getelementptr inbounds i32, ptr addrspace(1) %src, i64 %j8
+  %vb = load i32, ptr addrspace(1) %sb, align 4
+  %da = getelementptr inbounds i32, ptr %a, i64 %j
+  store i32 %va, ptr %da, align 4
+  %db = getelementptr inbounds i32, ptr %b, i64 %j
+  store i32 %vb, ptr %db, align 4
+  %j1 = add i64 %j, 1
+  %filled = icmp eq i64 %j1, 4
+  br i1 %filled, label %choose, label %fill
+
+choose:
+  %odd = trunc i32 %id to i1
+  br i1 %odd, label %useA, label %useB
+
+useA:
+  br label %read
+
+useB:
+  br label %read
+
+read:
+  %p = phi ptr [ %a, %useA ], [ %b, %useB ]
+  %k = and i64 %i, 3
+  %e = getelementptr inbounds i32, ptr %p, i64 %k
+  %v = load i32, ptr %e, align 4
+  %isA = icmp eq ptr %p, %a
+  %bonus = select i1 %isA, i32 1000, i32 0
+  %r = add i32 %v, %bonus
+  %o = getelementptr inbounds i32, ptr addrspace(1) %out, i64 %i
+  store i32 %r, ptr addrspace(1) %o, align 4
+  ret void
+}
+
+@first = internal addrspace(3) global [32 x i32] undef, align 4
+@second = internal addrspace(3) global [32 x i32] undef, align 4
+
+; a select of two threadgroup arrays: first[id] = in[id], second[id] = in[id + 32];
+; out[id] = (id odd ? first : second)[31 - id]
+define void @threadgroup_merged(ptr addrspace(1) %out, ptr addrspace(1) %in, i32 %id) #0 {
+  %i = zext i32 %id to i64
+  %i32 = add i64 %i, 32
+  %a = getelementptr inbounds i32, ptr addrspace(1) %in, i64 %i
+  %b = getelementptr inbounds i32, ptr addrspace(1) %in, i64 %i32
+  %va = load i32, ptr addrspace(1) %a, align 4
+  %vb = load i32, ptr addrspace(1) %b, align 4
+  %pa = getelementptr inbounds [32 x i32], ptr addrspace(3) @first, i64 0, i64 %i
+  store i32 %va, ptr addrspace(3) %pa, align 4
+  %pb = getelementptr inbounds [32 x i32], ptr addrspace(3) @second, i64 0, i64 %i
+  store i32 %vb, ptr addrspace(3) %pb, align 4
+  call void @air.wg.barrier(i32 2, i32 1)
+  %odd = trunc i32 %id to i1
+  %q = select i1 %odd, ptr addrspace(3) @first, ptr addrspace(3) @second
+  %r = sub i64 31, %i
+  %e = getelementptr inbounds i32, ptr addrspace(3) %q, i64 %r
+  %v = load i32, ptr addrspace(3) %e, align 4
+  %o = getelementptr inbounds i32, ptr addrspace(1) %out, i64 %i
+  store i32 %v, ptr addrspace(1) %o, align 4
+  ret void
+}
+
 declare void @llvm.memcpy.p3.p3.i64(ptr addrspace(3) noalias nocapture writeonly, ptr addrspace(3) noalias nocapture readonly, i64, i1 immarg) #1
 declare void @air.wg.barrier(i32, i32) #1
 declare i32 @air.atomic.local.add.s.i32(ptr addrspace(3), i32, i32, i32, i1) #1
@@ -386,7 +462,7 @@ attributes #0 = { nounwind }
 !llvm.module.flags = !{!0}
 !air.version = !{!1}
 !air.language_version = !{!2}
-!air.kernel = !{!10, !20, !30, !31, !32, !40, !41, !42, !43, !44, !45, !46, !47, !48, !49}
+!air.kernel = !{!10, !20, !30, !31, !32, !40, !41, !42, !43, !44, !45, !46, !47, !48, !49, !50, !51}
 
 !0 = !{i32 1, !"wchar_size", i32 4}
 !1 = !{i32 2, i32 2, i32 0}
@@ -418,3 +494,5 @@ attributes #0 = { nounwind }
 !47 = !{ptr @threadgroup_mixed_width, !3, !7}
 !48 = !{ptr @private_punning, !3, !7}
 !49 = !{ptr @threadgroup_dead, !3, !7}
+!50 = !{ptr @private_merged, !3, !7}
+!51 = !{ptr @threadgroup_merged, !3, !7}

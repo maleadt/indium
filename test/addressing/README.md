@@ -16,7 +16,8 @@ Compute kernels that reach memory through the pointer shapes AIR producers emit:
 - `threadgroup_atomic`: an atomic at a byte offset into threadgroup memory;
 - `threadgroup_punning`, `threadgroup_mixed_width`, `private_punning`: memory accessed as several
   types: floats and ints in one pool, longs, bytes and structs in one pool, two halves read as an int;
-- `threadgroup_dead`: threadgroup memory that is written and copied but never read.
+- `threadgroup_dead`: threadgroup memory that is written and copied but never read;
+- `private_merged`, `threadgroup_merged`: a pointer that may point into either of two arrays.
 
 `refused/escaped.ll` converts a threadgroup address to an integer, which has no translation, and
 `refused/atomic_narrow.ll` writes single bytes of memory that an atomic updates as ints.
@@ -35,7 +36,7 @@ in the MTLB container Iridium reads:
         kernel:pointer_select kernel:pointer_phi kernel:pointer_integer kernel:threadgroup_derived \
         kernel:private_derived kernel:threadgroup_bytes kernel:threadgroup_subword kernel:threadgroup_phi \
         kernel:threadgroup_atomic kernel:threadgroup_punning kernel:threadgroup_mixed_width \
-        kernel:private_punning kernel:threadgroup_dead
+        kernel:private_punning kernel:threadgroup_dead kernel:private_merged kernel:threadgroup_merged
 
 and each `refused/<name>.ll` the same way, with `kernel:<name>`.
 

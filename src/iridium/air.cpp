@@ -1101,6 +1101,8 @@ private:
 	// The variable a pointer is derived from, nullptr for one not derived from a variable (a buffer argument, a
 	// pointer loaded from memory), or `conflict()` for one that may point into several.
 	LLVMValueRef rootValue(LLVMValueRef pointer);
+	LLVMValueRef find(LLVMValueRef variable);
+	static Iridium::SPIRV::StorageClass storageClassOf(LLVMValueRef variable);
 	LLVMValueRef baseRoot(LLVMValueRef pointer);
 	static LLVMValueRef conflict() { return reinterpret_cast<LLVMValueRef>(uintptr_t(1)); }
 	static LLVMValueRef unknown() { return reinterpret_cast<LLVMValueRef>(uintptr_t(2)); }
@@ -1125,6 +1127,9 @@ private:
 	std::unordered_map<LLVMValueRef, LLVMValueRef> _derived;
 	std::unordered_map<LLVMValueRef, Root> _roots;
 	std::unordered_map<LLVMValueRef, Offset> _offsets;
+	// variables merged into one, as a union-find forest, and the offset each starts at in it
+	std::unordered_map<LLVMValueRef, LLVMValueRef> _merged;
+	std::unordered_map<LLVMValueRef, uint64_t> _bases;
 };
 
 static bool isConstantExpr(LLVMValueRef value, LLVMOpcode opcode) {
@@ -1164,7 +1169,23 @@ LLVMValueRef LocalMemory::baseRoot(LLVMValueRef pointer) {
 
 LLVMValueRef LocalMemory::rootValue(LLVMValueRef pointer) {
 	auto found = _derived.find(pointer);
-	return found != _derived.end() ? found->second : baseRoot(pointer);
+	auto root = found != _derived.end() ? found->second : baseRoot(pointer);
+	return isVariable(root) ? find(root) : root;
+}
+
+LLVMValueRef LocalMemory::find(LLVMValueRef variable) {
+	auto found = _merged.find(variable);
+	if (found == _merged.end() || found->second == variable) {
+		return variable;
+	}
+	return found->second = find(found->second);
+}
+
+Iridium::SPIRV::StorageClass LocalMemory::storageClassOf(LLVMValueRef variable) {
+	if (DynamicLLVM::LLVMGetValueKind(variable) != LLVMGlobalVariableValueKind) {
+		return Iridium::SPIRV::StorageClass::Function;
+	}
+	return DynamicLLVM::LLVMGetPointerAddressSpace(DynamicLLVM::LLVMTypeOf(variable)) == 3 ? Iridium::SPIRV::StorageClass::Workgroup : Iridium::SPIRV::StorageClass::Private;
 }
 
 void LocalMemory::analyze(const std::vector<LLVMValueRef>& instructions) {
@@ -1178,9 +1199,16 @@ void LocalMemory::analyze(const std::vector<LLVMValueRef>& instructions) {
 			_derived[inst] = unknown();
 		}
 	}
-	auto join = [](LLVMValueRef a, LLVMValueRef b) {
+	// A pointer that may point into two variables of the same storage class merges them into one (see layOut).
+	auto join = [&](LLVMValueRef a, LLVMValueRef b) {
 		if (a == unknown()) return b;
 		if (b == unknown() || a == b) return a;
+		if (isVariable(a) && isVariable(b) && storageClassOf(a) == storageClassOf(b) && storageClassOf(a) != Iridium::SPIRV::StorageClass::Private) {
+			_merged.emplace(a, a);
+			_merged[find(b)] = find(a);
+			_merged.emplace(b, find(a));
+			return find(a);
+		}
 		return conflict();
 	};
 	for (bool changed = true; changed;) {
@@ -1200,16 +1228,15 @@ void LocalMemory::analyze(const std::vector<LLVMValueRef>& instructions) {
 			} else {
 				root = rootValue(DynamicLLVM::LLVMGetOperand(inst, 0));
 			}
-			if (root != _derived[inst]) {
-				_derived[inst] = root;
+			auto& previous = _derived[inst];
+			if (root != (isVariable(previous) ? find(previous) : previous)) {
+				previous = root;
 				changed = true;
 			}
 		}
 	}
 	for (auto& [inst, root]: _derived) {
-		if (root == unknown()) {
-			root = nullptr;
-		}
+		root = root == unknown() ? nullptr : isVariable(root) ? find(root) : root;
 	}
 
 	// Every access to each variable, and the variables that must stay with, or must leave, the access-chain translation.
@@ -1373,6 +1400,18 @@ void LocalMemory::analyze(const std::vector<LLVMValueRef>& instructions) {
 			variables.insert(source);
 		}
 	}
+	// where each variable first appears, so that merged variables are laid out in a stable order
+	std::unordered_map<LLVMValueRef, size_t> order;
+	for (auto inst: instructions) {
+		order.emplace(inst, order.size());
+		for (int i = 0; i < DynamicLLVM::LLVMGetNumOperands(inst); ++i) {
+			auto operand = DynamicLLVM::LLVMGetOperand(inst, i);
+			auto root = operand ? baseRoot(operand) : nullptr;
+			if (root) {
+				order.emplace(root, order.size());
+			}
+		}
+	}
 	for (auto root: variables) {
 		Root info;
 		info.value = root;
@@ -1381,7 +1420,33 @@ void LocalMemory::analyze(const std::vector<LLVMValueRef>& instructions) {
 		info.storageClass = alloca ? Iridium::SPIRV::StorageClass::Function
 			: DynamicLLVM::LLVMGetPointerAddressSpace(DynamicLLVM::LLVMTypeOf(root)) == 3 ? Iridium::SPIRV::StorageClass::Workgroup
 			: Iridium::SPIRV::StorageClass::Private;
-		bool typed = !offsetOnly.count(root);
+		// the variables merged into this one, one after the other, each aligned as declared
+		std::vector<LLVMValueRef> members;
+		for (auto& [member, parent]: _merged) {
+			if (find(member) == root) {
+				members.push_back(member);
+			}
+		}
+		if (members.empty()) {
+			members.push_back(root);
+		}
+		std::sort(members.begin(), members.end(), [&](LLVMValueRef a, LLVMValueRef b) { return order.at(a) < order.at(b); });
+		uint64_t size = 0, alignment = UINT64_MAX;
+		for (auto member: members) {
+			auto type = DynamicLLVM::LLVMGetValueKind(member) == LLVMGlobalVariableValueKind ? DynamicLLVM::LLVMGlobalGetValueType(member) : DynamicLLVM::LLVMGetAllocatedType(member);
+			uint64_t memberAlignment = DynamicLLVM::LLVMGetAlignment(member);
+			if (!memberAlignment) {
+				memberAlignment = DynamicLLVM::LLVMABIAlignmentOfType(_layout, type);
+			}
+			size = (size + memberAlignment - 1) / memberAlignment * memberAlignment;
+			if (members.size() > 1) {
+				_bases[member] = size;
+			}
+			size += DynamicLLVM::LLVMABISizeOfType(_layout, type);
+			alignment = std::min(alignment, memberAlignment);
+		}
+
+		bool typed = !offsetOnly.count(root) && members.size() == 1;
 		for (auto& [inst, derivedRoot]: _derived) {
 			if (derivedRoot == root && !typedPointee(inst, root)) {
 				typed = false;
@@ -1425,16 +1490,11 @@ void LocalMemory::analyze(const std::vector<LLVMValueRef>& instructions) {
 		if (list.empty()) {
 			throw ImpossibleResultID(valueName(root) + " is addressed but never accessed");
 		}
-		uint64_t alignment = DynamicLLVM::LLVMGetAlignment(root);
-		if (!alignment) {
-			alignment = DynamicLLVM::LLVMABIAlignmentOfType(_layout, info.declaredType);
-		}
 		chooseElement(info, list.front().type, alignment, [&](auto&& visit) {
 			for (auto& access: list) {
 				visit(access.type, access.alignment, access.atomic);
 			}
 		});
-		auto size = DynamicLLVM::LLVMABISizeOfType(_layout, info.declaredType);
 		info.count = (size + info.elementSize - 1) / info.elementSize;
 
 		// a constant keeps its initializer only if it already is an array of the element type
@@ -1587,8 +1647,10 @@ LLVMTypeRef LocalMemory::typedPointee(LLVMValueRef pointer, LLVMValueRef root) {
 }
 
 LocalMemory::Offset LocalMemory::offsetOf(LLVMValueRef pointer) {
-	if (_roots.count(pointer)) {
-		return Offset {};
+	if (baseRoot(pointer) == pointer) {
+		// a variable starts where it was laid out in its group, or at 0
+		auto base = _bases.find(pointer);
+		return Offset { Iridium::SPIRV::ResultIDInvalid, base == _bases.end() ? 0 : static_cast<int64_t>(base->second) };
 	}
 	if (isConstantExpr(pointer, LLVMGetElementPtr)) {
 		return getelementptr(pointer);
