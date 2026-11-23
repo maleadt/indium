@@ -1,6 +1,7 @@
 #include <optional>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <iridium/air.hpp>
 #include <iridium/bits.hpp>
 #include <iridium/spirv.hpp>
@@ -1015,11 +1016,557 @@ static Iridium::SPIRV::ResultID descendToFirstElement(Iridium::SPIRV::Builder& b
 	return access;
 }
 
+// Thread, threadgroup and constant memory addressed by byte offset.
+//
+// A local variable (an alloca, a threadgroup global or a program-scope constant) is declared as a SPIR-V variable of
+// its LLVM type and reached through access chains. That works while every pointer into it is a getelementptr rooted
+// at the variable and every access has the declared type, but producers emit more: getelementptrs on derived pointers
+// (`p = buf + tid; p[1]`), byte offsets (`getelementptr i8, ptr %p, i64 4`, LLVM's canonical form since LLVM 19),
+// byte arrays accessed as another type (Metal.jl declares all threadgroup memory as `[N x i8]`), and phis and selects
+// of pointers. None of these has a typed access chain.
+//
+// For a variable used like that, a pointer into it is a 32-bit byte offset from its start: a getelementptr is integer
+// arithmetic, a phi or select chooses an offset, and only a load, store or atomic turns an offset into an access
+// chain. The variable is redeclared as an array of the one type all its accesses use, indexed at offset / size. That
+// needs every access, and the variable, to be aligned to that type; a misaligned access is undefined behaviour in
+// LLVM, so an access's alignment is taken at its word.
+//
+// A variable whose uses the access-chain translation already handles keeps it, so that the modules it translates
+// stay the same. A variable whose address escapes (stored, passed to a function, converted to an integer) can't be
+// followed by either translation, so it is refused unless the access-chain translation handles it.
+class LocalMemory {
+public:
+	struct Root {
+		LLVMValueRef value = nullptr;
+		LLVMTypeRef declaredType = nullptr;
+		// the type of every access, its size, and how many of them the variable holds
+		LLVMTypeRef elementType = nullptr;
+		uint64_t elementSize = 0;
+		uint64_t count = 0;
+		Iridium::SPIRV::StorageClass storageClass = Iridium::SPIRV::StorageClass::Function;
+		Iridium::SPIRV::ResultID variable = Iridium::SPIRV::ResultIDInvalid;
+		Iridium::SPIRV::ResultID elementPointerType = Iridium::SPIRV::ResultIDInvalid;
+	};
+
+	// A byte offset: a dynamic part (ResultIDInvalid when there is none) plus a constant.
+	struct Offset {
+		Iridium::SPIRV::ResultID dynamic = Iridium::SPIRV::ResultIDInvalid;
+		int64_t constant = 0;
+	};
+
+	LocalMemory(Iridium::SPIRV::Builder& builder, LLVMModuleRef module): _builder(builder), _layout(DynamicLLVM::LLVMGetModuleDataLayout(module)) {}
+
+	// Decides from the uses in `instructions` which variables are addressed by byte offset.
+	void analyze(const std::vector<LLVMValueRef>& instructions);
+
+	// The variable a pointer points into, if that variable is addressed by byte offset.
+	Root* rootOf(LLVMValueRef pointer) {
+		if (!isPointer(pointer)) {
+			return nullptr;
+		}
+		auto found = _roots.find(rootValue(pointer));
+		return found == _roots.end() ? nullptr : &found->second;
+	}
+
+	// Whether a value is a variable itself (an alloca or global), whose offset is known from the start.
+	bool isRoot(LLVMValueRef value) {
+		return baseRoot(value) == value;
+	}
+
+	Iridium::SPIRV::ResultID offsetType() {
+		return _builder.declareType(Iridium::SPIRV::Type(Iridium::SPIRV::Type::IntegerTag {}, 32, false));
+	}
+
+	// The offset of a pointer that rootOf() accepts: its root, a constant expression, or an instruction translated before.
+	Offset offsetOf(LLVMValueRef pointer);
+	Offset getelementptr(LLVMValueRef gep);
+	Iridium::SPIRV::ResultID materialize(const Offset& offset);
+	// Records the offset an instruction producing a pointer stands for, and returns its value.
+	Iridium::SPIRV::ResultID define(LLVMValueRef inst, const Offset& offset);
+	// A pointer to the element that an access at `offset` reads or writes.
+	Iridium::SPIRV::ResultID elementPointer(Root& root, const Offset& offset);
+
+private:
+	static bool isPointer(LLVMValueRef value) {
+		return DynamicLLVM::LLVMGetTypeKind(DynamicLLVM::LLVMTypeOf(value)) == LLVMPointerTypeKind;
+	}
+	// The variable a pointer is derived from, nullptr for one not derived from a variable (a buffer argument, a
+	// pointer loaded from memory), or `conflict()` for one that may point into several.
+	LLVMValueRef rootValue(LLVMValueRef pointer);
+	LLVMValueRef baseRoot(LLVMValueRef pointer);
+	static LLVMValueRef conflict() { return reinterpret_cast<LLVMValueRef>(uintptr_t(1)); }
+	static LLVMValueRef unknown() { return reinterpret_cast<LLVMValueRef>(uintptr_t(2)); }
+	static bool isVariable(LLVMValueRef root) { return root && root != conflict() && root != unknown(); }
+	// The pointee of a pointer that the access-chain translation handles, or nullptr.
+	LLVMTypeRef typedPointee(LLVMValueRef pointer, LLVMValueRef root);
+	Iridium::SPIRV::ResultID indexToOffset(LLVMValueRef index);
+	void declare(Root& root);
+
+	Iridium::SPIRV::Builder& _builder;
+	LLVMTargetDataRef _layout;
+	std::unordered_map<LLVMValueRef, LLVMValueRef> _derived;
+	std::unordered_map<LLVMValueRef, Root> _roots;
+	std::unordered_map<LLVMValueRef, Offset> _offsets;
+};
+
+static bool isConstantExpr(LLVMValueRef value, LLVMOpcode opcode) {
+	return DynamicLLVM::LLVMGetValueKind(value) == LLVMConstantExprValueKind && DynamicLLVM::LLVMGetConstOpcode(value) == opcode;
+}
+
+static bool isInstruction(LLVMValueRef value, LLVMOpcode opcode) {
+	return DynamicLLVM::LLVMGetValueKind(value) == LLVMInstructionValueKind && DynamicLLVM::LLVMGetInstructionOpcode(value) == opcode;
+}
+
+static bool isUndefined(LLVMValueRef value) {
+	auto kind = DynamicLLVM::LLVMGetValueKind(value);
+	return kind == LLVMUndefValueValueKind || kind == LLVMPoisonValueValueKind;
+}
+
+static std::string valueName(LLVMValueRef value) {
+	size_t length = 0;
+	auto name = DynamicLLVM::LLVMGetValueName2(value, &length);
+	return length ? "\"" + std::string(name, length) + "\"" : "a local variable";
+}
+
+LLVMValueRef LocalMemory::baseRoot(LLVMValueRef pointer) {
+	auto kind = DynamicLLVM::LLVMGetValueKind(pointer);
+	if (kind == LLVMGlobalVariableValueKind) {
+		// threadgroup memory and program-scope constants (a constant buffer is an argument, not a global)
+		auto space = DynamicLLVM::LLVMGetPointerAddressSpace(DynamicLLVM::LLVMTypeOf(pointer));
+		return space == 0 || space == 2 || space == 3 ? pointer : nullptr;
+	}
+	if (isInstruction(pointer, LLVMAlloca)) {
+		return pointer;
+	}
+	if (isConstantExpr(pointer, LLVMGetElementPtr) || isConstantExpr(pointer, LLVMBitCast)) {
+		return baseRoot(DynamicLLVM::LLVMGetOperand(pointer, 0));
+	}
+	return nullptr;
+}
+
+LLVMValueRef LocalMemory::rootValue(LLVMValueRef pointer) {
+	auto found = _derived.find(pointer);
+	return found != _derived.end() ? found->second : baseRoot(pointer);
+}
+
+void LocalMemory::analyze(const std::vector<LLVMValueRef>& instructions) {
+	// What each derived pointer points into, as a fixed point over the instructions that derive pointers: phis can
+	// form cycles. `unknown()` is the starting point; a variable, nullptr or `conflict()` replace it.
+	std::vector<LLVMValueRef> derived;
+	for (auto inst: instructions) {
+		auto opcode = DynamicLLVM::LLVMGetInstructionOpcode(inst);
+		if (isPointer(inst) && (opcode == LLVMGetElementPtr || opcode == LLVMBitCast || opcode == LLVMPHI || opcode == LLVMSelect)) {
+			derived.push_back(inst);
+			_derived[inst] = unknown();
+		}
+	}
+	auto join = [](LLVMValueRef a, LLVMValueRef b) {
+		if (a == unknown()) return b;
+		if (b == unknown() || a == b) return a;
+		return conflict();
+	};
+	for (bool changed = true; changed;) {
+		changed = false;
+		for (auto inst: derived) {
+			auto opcode = DynamicLLVM::LLVMGetInstructionOpcode(inst);
+			LLVMValueRef root = unknown();
+			if (opcode == LLVMPHI || opcode == LLVMSelect) {
+				bool phi = opcode == LLVMPHI;
+				unsigned count = phi ? DynamicLLVM::LLVMCountIncoming(inst) : 2;
+				for (unsigned i = 0; i < count; ++i) {
+					auto incoming = phi ? DynamicLLVM::LLVMGetIncomingValue(inst, i) : DynamicLLVM::LLVMGetOperand(inst, i + 1);
+					if (!isUndefined(incoming)) {
+						root = join(root, rootValue(incoming));
+					}
+				}
+			} else {
+				root = rootValue(DynamicLLVM::LLVMGetOperand(inst, 0));
+			}
+			if (root != _derived[inst]) {
+				_derived[inst] = root;
+				changed = true;
+			}
+		}
+	}
+	for (auto& [inst, root]: _derived) {
+		if (root == unknown()) {
+			root = nullptr;
+		}
+	}
+
+	// Every access to each variable, and the variables that must stay with, or must leave, the access-chain translation.
+	struct Access {
+		LLVMValueRef pointer;
+		LLVMTypeRef type;
+		uint64_t alignment;
+	};
+	std::unordered_map<LLVMValueRef, std::vector<Access>> accesses;
+	std::unordered_set<LLVMValueRef> escaped, offsetOnly;
+	auto access = [&](LLVMValueRef pointer, LLVMTypeRef type, uint64_t alignment) {
+		auto root = rootValue(pointer);
+		if (isVariable(root)) {
+			accesses[root].push_back(Access { pointer, type, alignment ? alignment : DynamicLLVM::LLVMABIAlignmentOfType(_layout, type) });
+		}
+	};
+	auto escape = [&](LLVMValueRef value) {
+		if (isPointer(value)) {
+			auto root = rootValue(value);
+			if (isVariable(root)) {
+				escaped.insert(root);
+			}
+		}
+	};
+
+	for (auto inst: instructions) {
+		auto opcode = DynamicLLVM::LLVMGetInstructionOpcode(inst);
+		auto operands = DynamicLLVM::LLVMGetNumOperands(inst);
+		switch (opcode) {
+			case LLVMLoad:
+				access(DynamicLLVM::LLVMGetOperand(inst, 0), DynamicLLVM::LLVMTypeOf(inst), DynamicLLVM::LLVMGetAlignment(inst));
+				break;
+
+			case LLVMStore:
+				escape(DynamicLLVM::LLVMGetOperand(inst, 0));
+				access(DynamicLLVM::LLVMGetOperand(inst, 1), DynamicLLVM::LLVMTypeOf(DynamicLLVM::LLVMGetOperand(inst, 0)), DynamicLLVM::LLVMGetAlignment(inst));
+				break;
+
+			case LLVMGetElementPtr:
+			case LLVMBitCast:
+				break;
+
+			case LLVMPHI:
+			case LLVMSelect:
+				// a pointer that may point into several variables would need them merged into one
+				if (isPointer(inst) && _derived[inst] == conflict()) {
+					for (int i = 0; i < operands; ++i) {
+						escape(DynamicLLVM::LLVMGetOperand(inst, i));
+					}
+				}
+				break;
+
+			case LLVMICmp: {
+				auto lhs = DynamicLLVM::LLVMGetOperand(inst, 0), rhs = DynamicLLVM::LLVMGetOperand(inst, 1);
+				auto predicate = DynamicLLVM::LLVMGetICmpPredicate(inst);
+				// offsets into one variable compare like the pointers; the access-chain translation has no comparison
+				if (isPointer(lhs) && isVariable(rootValue(lhs)) && rootValue(lhs) == rootValue(rhs) && (predicate == LLVMIntEQ || predicate == LLVMIntNE)) {
+					offsetOnly.insert(rootValue(lhs));
+				} else {
+					escape(lhs);
+					escape(rhs);
+				}
+			} break;
+
+			case LLVMCall: {
+				size_t length = 0;
+				auto rawName = DynamicLLVM::LLVMGetValueName2(DynamicLLVM::LLVMGetCalledValue(inst), &length);
+				std::string_view name(rawName ? rawName : "", rawName ? length : 0);
+				if (name.substr(0, 14) == "llvm.lifetime.") {
+					break;
+				}
+				// the last operand is the callee
+				auto arguments = operands - 1;
+				if (name.substr(0, 11) == "air.atomic." && arguments >= 2 && isPointer(DynamicLLVM::LLVMGetOperand(inst, 0))) {
+					// the memory has the type of the value the function returns or takes
+					auto type = DynamicLLVM::LLVMTypeOf(inst);
+					if (DynamicLLVM::LLVMGetTypeKind(type) == LLVMVoidTypeKind) {
+						type = DynamicLLVM::LLVMTypeOf(DynamicLLVM::LLVMGetOperand(inst, 1));
+					}
+					access(DynamicLLVM::LLVMGetOperand(inst, 0), type, 0);
+					if (name.find(".cmpxchg.") != name.npos && isPointer(DynamicLLVM::LLVMGetOperand(inst, 1))) {
+						// compare-and-exchange reads and writes the expected value through its second argument
+						access(DynamicLLVM::LLVMGetOperand(inst, 1), type, 0);
+					}
+					break;
+				}
+				for (int i = 0; i < arguments; ++i) {
+					escape(DynamicLLVM::LLVMGetOperand(inst, i));
+				}
+			} break;
+
+			default:
+				for (int i = 0; i < operands; ++i) {
+					escape(DynamicLLVM::LLVMGetOperand(inst, i));
+				}
+				break;
+		}
+	}
+
+	// A variable joins the byte-offset path when the access-chain translation can't handle it.
+	std::unordered_set<LLVMValueRef> variables;
+	for (auto& [inst, root]: _derived) {
+		if (isVariable(root)) {
+			variables.insert(root);
+		}
+	}
+	for (auto& [root, list]: accesses) {
+		variables.insert(root);
+	}
+	for (auto root: variables) {
+		bool typed = !offsetOnly.count(root);
+		for (auto& [inst, derivedRoot]: _derived) {
+			if (derivedRoot == root && !typedPointee(inst, root)) {
+				typed = false;
+			}
+		}
+		for (auto& access: accesses[root]) {
+			// a load or store reaches the pointee or, at offset zero, its first element
+			auto pointee = typedPointee(access.pointer, root);
+			while (pointee && pointee != access.type) {
+				auto kind = DynamicLLVM::LLVMGetTypeKind(pointee);
+				pointee = kind == LLVMArrayTypeKind ? DynamicLLVM::LLVMGetElementType(pointee)
+					: kind == LLVMStructTypeKind && DynamicLLVM::LLVMCountStructElementTypes(pointee) > 0 ? DynamicLLVM::LLVMStructGetTypeAtIndex(pointee, 0)
+					: nullptr;
+			}
+			typed = typed && pointee;
+		}
+		if (typed) {
+			continue;
+		}
+		if (escaped.count(root)) {
+			throw ImpossibleResultID("the address of " + valueName(root) + " escapes: it is stored, passed to a function, converted to an integer, "
+				"or may point into another variable");
+		}
+
+		Root info;
+		info.value = root;
+		bool alloca = DynamicLLVM::LLVMGetValueKind(root) != LLVMGlobalVariableValueKind;
+		info.declaredType = alloca ? DynamicLLVM::LLVMGetAllocatedType(root) : DynamicLLVM::LLVMGlobalGetValueType(root);
+		info.storageClass = alloca ? Iridium::SPIRV::StorageClass::Function
+			: DynamicLLVM::LLVMGetPointerAddressSpace(DynamicLLVM::LLVMTypeOf(root)) == 3 ? Iridium::SPIRV::StorageClass::Workgroup
+			: Iridium::SPIRV::StorageClass::Private;
+		uint64_t alignment = DynamicLLVM::LLVMGetAlignment(root);
+		if (!alignment) {
+			alignment = DynamicLLVM::LLVMABIAlignmentOfType(_layout, info.declaredType);
+		}
+
+		auto& list = accesses[root];
+		if (list.empty()) {
+			throw ImpossibleResultID(valueName(root) + " is addressed but never accessed");
+		}
+		info.elementType = list.front().type;
+		auto kind = DynamicLLVM::LLVMGetTypeKind(info.elementType);
+		auto scalar = kind == LLVMVectorTypeKind ? DynamicLLVM::LLVMGetElementType(info.elementType) : info.elementType;
+		auto scalarKind = DynamicLLVM::LLVMGetTypeKind(scalar);
+		bool supported = scalarKind == LLVMHalfTypeKind || scalarKind == LLVMFloatTypeKind || scalarKind == LLVMDoubleTypeKind
+			|| (scalarKind == LLVMIntegerTypeKind && DynamicLLVM::LLVMGetIntTypeWidth(scalar) >= 8);
+		if (kind == LLVMVectorTypeKind && DynamicLLVM::LLVMGetVectorSize(info.elementType) != 2 && DynamicLLVM::LLVMGetVectorSize(info.elementType) != 4) {
+			supported = false;
+		}
+		info.elementSize = DynamicLLVM::LLVMABISizeOfType(_layout, info.elementType);
+		for (auto& access: list) {
+			supported = supported && access.type == info.elementType && access.alignment >= info.elementSize;
+		}
+		if (!supported || alignment < info.elementSize) {
+			throw ImpossibleResultID(valueName(root) + " is accessed as several types, or at offsets not aligned to its type");
+		}
+		auto size = DynamicLLVM::LLVMABISizeOfType(_layout, info.declaredType);
+		info.count = (size + info.elementSize - 1) / info.elementSize;
+
+		// a constant keeps its initializer only if it already is an array of the element type
+		if (!alloca) {
+			auto initializer = DynamicLLVM::LLVMGetInitializer(root);
+			bool array = DynamicLLVM::LLVMGetTypeKind(info.declaredType) == LLVMArrayTypeKind
+				&& DynamicLLVM::LLVMGetElementType(info.declaredType) == info.elementType
+				&& DynamicLLVM::LLVMGetArrayLength(info.declaredType) == info.count;
+			if (info.storageClass == Iridium::SPIRV::StorageClass::Private && initializer && !isUndefined(initializer) && !array) {
+				throw ImpossibleResultID(valueName(root) + " is a constant accessed as another type than it is declared with");
+			}
+		}
+
+		_roots.emplace(root, info);
+	}
+}
+
+LLVMTypeRef LocalMemory::typedPointee(LLVMValueRef pointer, LLVMValueRef root) {
+	auto declared = DynamicLLVM::LLVMGetValueKind(root) == LLVMGlobalVariableValueKind ? DynamicLLVM::LLVMGlobalGetValueType(root) : DynamicLLVM::LLVMGetAllocatedType(root);
+	if (pointer == root) {
+		return declared;
+	}
+	if (isInstruction(pointer, LLVMBitCast) || isConstantExpr(pointer, LLVMBitCast)) {
+		return typedPointee(DynamicLLVM::LLVMGetOperand(pointer, 0), root);
+	}
+	if (!isInstruction(pointer, LLVMGetElementPtr) && !isConstantExpr(pointer, LLVMGetElementPtr)) {
+		return nullptr;
+	}
+	// a getelementptr of the variable itself, of its declared type, with a first index of zero
+	auto operands = DynamicLLVM::LLVMGetNumOperands(pointer);
+	auto first = operands > 1 ? DynamicLLVM::LLVMGetOperand(pointer, 1) : nullptr;
+	if (DynamicLLVM::LLVMGetOperand(pointer, 0) != root || DynamicLLVM::LLVMGetGEPSourceElementType(pointer) != declared
+		|| !first || !DynamicLLVM::LLVMIsAConstantInt(first) || DynamicLLVM::LLVMConstIntGetZExtValue(first) != 0) {
+		return nullptr;
+	}
+	auto type = declared;
+	for (int i = 2; i < operands; ++i) {
+		auto index = DynamicLLVM::LLVMGetOperand(pointer, i);
+		switch (DynamicLLVM::LLVMGetTypeKind(type)) {
+			case LLVMArrayTypeKind:
+			case LLVMVectorTypeKind:
+				type = DynamicLLVM::LLVMGetElementType(type);
+				break;
+			case LLVMStructTypeKind:
+				if (!DynamicLLVM::LLVMIsAConstantInt(index)) {
+					return nullptr;
+				}
+				type = DynamicLLVM::LLVMStructGetTypeAtIndex(type, DynamicLLVM::LLVMConstIntGetZExtValue(index));
+				break;
+			default:
+				return nullptr;
+		}
+	}
+	return type;
+}
+
+LocalMemory::Offset LocalMemory::offsetOf(LLVMValueRef pointer) {
+	if (_roots.count(pointer)) {
+		return Offset {};
+	}
+	if (isConstantExpr(pointer, LLVMGetElementPtr)) {
+		return getelementptr(pointer);
+	}
+	if (isConstantExpr(pointer, LLVMBitCast)) {
+		return offsetOf(DynamicLLVM::LLVMGetOperand(pointer, 0));
+	}
+	auto found = _offsets.find(pointer);
+	if (found == _offsets.end()) {
+		throw ImpossibleResultID("a pointer into " + valueName(_derived[pointer]) + " is used before it is defined");
+	}
+	return found->second;
+}
+
+Iridium::SPIRV::ResultID LocalMemory::indexToOffset(LLVMValueRef index) {
+	using namespace Iridium::SPIRV;
+	auto id = llvmValueToResultID(_builder, index);
+	auto width = DynamicLLVM::LLVMGetIntTypeWidth(DynamicLLVM::LLVMTypeOf(index));
+	if (width > 32) {
+		// the low 32 bits: offsets into local memory wrap like the full-width address would
+		return _builder.encodeUConvert(offsetType(), id);
+	}
+	if (width < 32) {
+		// getelementptr indices are signed
+		id = _builder.encodeArithUnop(Opcode::SConvert, _builder.declareType(Type(Type::IntegerTag {}, 32, true)), id);
+	}
+	return _builder.encodeBitcast(offsetType(), id);
+}
+
+LocalMemory::Offset LocalMemory::getelementptr(LLVMValueRef gep) {
+	using namespace Iridium::SPIRV;
+	auto offset = offsetOf(DynamicLLVM::LLVMGetOperand(gep, 0));
+	auto add = [&](LLVMValueRef index, uint64_t stride) {
+		if (DynamicLLVM::LLVMIsAConstantInt(index)) {
+			offset.constant += DynamicLLVM::LLVMConstIntGetSExtValue(index) * static_cast<int64_t>(stride);
+			return;
+		}
+		auto term = indexToOffset(index);
+		if (stride != 1) {
+			term = _builder.encodeArithBinop(Opcode::IMul, offsetType(), term, _builder.declareConstantScalar<uint32_t>(stride));
+		}
+		offset.dynamic = offset.dynamic == ResultIDInvalid ? term : _builder.encodeArithBinop(Opcode::IAdd, offsetType(), offset.dynamic, term);
+	};
+
+	auto type = DynamicLLVM::LLVMGetGEPSourceElementType(gep);
+	auto operands = DynamicLLVM::LLVMGetNumOperands(gep);
+	for (int i = 1; i < operands; ++i) {
+		auto index = DynamicLLVM::LLVMGetOperand(gep, i);
+		if (i == 1) {
+			add(index, DynamicLLVM::LLVMABISizeOfType(_layout, type));
+			continue;
+		}
+		switch (DynamicLLVM::LLVMGetTypeKind(type)) {
+			case LLVMStructTypeKind: {
+				auto member = DynamicLLVM::LLVMConstIntGetZExtValue(index);
+				offset.constant += DynamicLLVM::LLVMOffsetOfElement(_layout, type, member);
+				type = DynamicLLVM::LLVMStructGetTypeAtIndex(type, member);
+			} break;
+			case LLVMArrayTypeKind:
+			case LLVMVectorTypeKind:
+				type = DynamicLLVM::LLVMGetElementType(type);
+				add(index, DynamicLLVM::LLVMABISizeOfType(_layout, type));
+				break;
+			default:
+				throw ImpossibleResultID("getelementptr descends into a non-aggregate type");
+		}
+	}
+	return offset;
+}
+
+Iridium::SPIRV::ResultID LocalMemory::materialize(const Offset& offset) {
+	using namespace Iridium::SPIRV;
+	auto constant = _builder.declareConstantScalar<uint32_t>(static_cast<uint32_t>(offset.constant));
+	if (offset.dynamic == ResultIDInvalid) {
+		return constant;
+	}
+	return offset.constant == 0 ? offset.dynamic : _builder.encodeArithBinop(Opcode::IAdd, offsetType(), offset.dynamic, constant);
+}
+
+Iridium::SPIRV::ResultID LocalMemory::define(LLVMValueRef inst, const Offset& offset) {
+	auto id = materialize(offset);
+	_offsets[inst] = offset;
+	_builder.associateExistingResultID(id, reinterpret_cast<uintptr_t>(inst));
+	_builder.setResultType(id, offsetType());
+	return id;
+}
+
+void LocalMemory::declare(Root& root) {
+	using namespace Iridium::SPIRV;
+	LayoutFreeScope layoutFree(true);
+	auto element = llvmTypeToSPIRVType(_builder, root.elementType);
+	auto elementInfo = *_builder.reverseLookupType(element);
+	Type arrayType(Type::ArrayTag {}, element, root.count, root.count * elementInfo.size, elementInfo.alignment);
+	arrayType.layoutFree = true;
+	auto pointerType = _builder.declareType(Type(Type::PointerTag {}, root.storageClass, _builder.declareType(arrayType), 8));
+	root.elementPointerType = _builder.declareType(Type(Type::PointerTag {}, root.storageClass, element, 8));
+
+	if (root.storageClass == StorageClass::Function) {
+		root.variable = _builder.addFunctionVariable(pointerType);
+		return;
+	}
+	ResultID initializer = ResultIDInvalid;
+	if (root.storageClass == StorageClass::Private) {
+		auto value = DynamicLLVM::LLVMGetInitializer(root.value);
+		if (value && !isUndefined(value)) {
+			initializer = llvmValueToResultID(_builder, value);
+		}
+	}
+	root.variable = _builder.addGlobalVariable(pointerType, root.storageClass, initializer);
+	_builder.setResultType(root.variable, pointerType);
+}
+
+Iridium::SPIRV::ResultID LocalMemory::elementPointer(Root& root, const Offset& offset) {
+	using namespace Iridium::SPIRV;
+	if (root.variable == ResultIDInvalid) {
+		declare(root);
+	}
+	if (root.storageClass != StorageClass::Function) {
+		_builder.referenceGlobalVariable(root.variable);
+	}
+
+	ResultID index;
+	if (offset.dynamic == ResultIDInvalid) {
+		if (offset.constant % root.elementSize != 0) {
+			throw ImpossibleResultID(valueName(root.value) + " is accessed at an offset not aligned to its type");
+		}
+		index = _builder.declareConstantScalar<uint32_t>(static_cast<uint32_t>(offset.constant / root.elementSize));
+	} else {
+		// the element size is a power of two, and the access's alignment makes the offset a multiple of it
+		uint32_t shift = 0;
+		while ((uint64_t(1) << shift) < root.elementSize) {
+			++shift;
+		}
+		index = materialize(offset);
+		if (shift) {
+			index = _builder.encodeArithBinop(Opcode::ShiftRightLogical, offsetType(), index, _builder.declareConstantScalar<uint32_t>(shift));
+		}
+	}
+	auto pointer = _builder.encodeAccessChain(root.elementPointerType, root.variable, { index });
+	_builder.setResultType(pointer, root.elementPointerType);
+	return pointer;
+}
+
 // Translates the AIR atomic functions of 32-bit and 64-bit integers and of 32-bit floats,
 // air.atomic.<global|local>.<operation>[.<s|u>].<i32|i64|f32>, whose arguments are the pointer, the value (not for a load), the memory order, the scope and a volatile flag. Returns
 // false when `name` is not one of them. The order is relaxed unless the module asks for more. The functions that update
 // memory return the value that was there before, except the 64-bit minimum and maximum, which return nothing.
-static bool translateAirAtomic(Iridium::SPIRV::Builder& builder, LLVMValueRef inst, std::string_view name, Iridium::SPIRV::ResultID resultType, Iridium::SPIRV::ResultID& resID) {
+static bool translateAirAtomic(Iridium::SPIRV::Builder& builder, LocalMemory& local, LLVMValueRef inst, std::string_view name, Iridium::SPIRV::ResultID resultType, Iridium::SPIRV::ResultID& resID) {
 	using namespace Iridium::SPIRV;
 	constexpr std::string_view prefix = "air.atomic.";
 	if (name.substr(0, prefix.size()) != prefix) {
@@ -1069,14 +1616,18 @@ static bool translateAirAtomic(Iridium::SPIRV::Builder& builder, LLVMValueRef in
 	// SPIR-V memory semantics: relaxed is none, anything stronger acquire-release (Metal only has relaxed)
 	uint32_t semantics = order == 0 ? 0 : 0x8;
 
-	auto pointer = llvmValueToResultID(builder, DynamicLLVM::LLVMGetOperand(inst, 0));
+	auto pointerOperand = DynamicLLVM::LLVMGetOperand(inst, 0);
+	auto offsetRoot = local.rootOf(pointerOperand);
+	auto pointer = offsetRoot ? local.elementPointer(*offsetRoot, local.offsetOf(pointerOperand)) : llvmValueToResultID(builder, pointerOperand);
 	auto pointerInfo = builder.reverseLookupType(builder.lookupResultType(pointer));
 	if (!pointerInfo || pointerInfo->backingType != Type::BackingType::Pointer) {
 		throw ImpossibleResultID("atomic function on something that is not a pointer");
 	}
 	auto storageClass = pointerInfo->pointerStorageClass;
 	auto integerType = isFloat ? builder.declareType(Type(Type::FloatTag {}, 32)) : builder.declareType(Type(Type::IntegerTag {}, width, true));
-	if (isLogicalStorageClass(storageClass)) {
+	if (offsetRoot) {
+		// already a pointer to the element type, which the analysis checked is the atomic's
+	} else if (isLogicalStorageClass(storageClass)) {
 		pointer = descendToFirstElement(builder, pointer, ResultIDInvalid);
 	} else if (pointerInfo->targetType != integerType) {
 		// a physical pointer: view the memory as the integer the function works on
@@ -1110,12 +1661,16 @@ static bool translateAirAtomic(Iridium::SPIRV::Builder& builder, LLVMValueRef in
 		}
 		// (pointer, pointer to the expected value, desired value, success order, failure order, ...): the value found in
 		// memory is also written to the expected value (on a success it equals it already)
-		auto expectedPointer = llvmValueToResultID(builder, DynamicLLVM::LLVMGetOperand(inst, 1));
+		auto expectedOperand = DynamicLLVM::LLVMGetOperand(inst, 1);
+		auto expectedRoot = local.rootOf(expectedOperand);
+		auto expectedPointer = expectedRoot ? local.elementPointer(*expectedRoot, local.offsetOf(expectedOperand)) : llvmValueToResultID(builder, expectedOperand);
 		auto expectedInfo = builder.reverseLookupType(builder.lookupResultType(expectedPointer));
 		if (!expectedInfo || expectedInfo->backingType != Type::BackingType::Pointer || !isLogicalStorageClass(expectedInfo->pointerStorageClass)) {
 			throw ImpossibleResultID("compare-and-exchange with an expected value that is not a local variable");
 		}
-		expectedPointer = descendToFirstElement(builder, expectedPointer, ResultIDInvalid);
+		if (!expectedRoot) {
+			expectedPointer = descendToFirstElement(builder, expectedPointer, ResultIDInvalid);
+		}
 		auto expectedType = builder.reverseLookupType(builder.lookupResultType(expectedPointer))->targetType;
 		auto expected = asMemoryType(builder.encodeLoad(expectedType, expectedPointer));
 		auto desired = asMemoryType(llvmValueToResultID(builder, DynamicLLVM::LLVMGetOperand(inst, 2)));
@@ -3293,6 +3848,18 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 		}
 	}
 
+	// thread, threadgroup and constant memory addressed by byte offset (see LocalMemory)
+	LocalMemory local(builder, _module.get());
+	{
+		std::vector<LLVMValueRef> instructions = initializerInstructions;
+		for (auto bb = DynamicLLVM::LLVMGetFirstBasicBlock(_function); bb; bb = DynamicLLVM::LLVMGetNextBasicBlock(bb)) {
+			for (auto inst = DynamicLLVM::LLVMGetFirstInstruction(bb); inst; inst = DynamicLLVM::LLVMGetNextInstruction(inst)) {
+				instructions.push_back(inst);
+			}
+		}
+		local.analyze(instructions);
+	}
+
 	// assign an ID to each block
 	bool isFirst = true;
 	for (LLVMBasicBlockRef bb = DynamicLLVM::LLVMGetFirstBasicBlock(_function); bb != nullptr; bb = DynamicLLVM::LLVMGetNextBasicBlock(bb)) {
@@ -3569,7 +4136,7 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 		for (LLVMValueRef inst = DynamicLLVM::LLVMGetFirstInstruction(bb); inst != nullptr; inst = DynamicLLVM::LLVMGetNextInstruction(inst)) {
 			if (DynamicLLVM::LLVMGetInstructionOpcode(inst) == LLVMPHI) {
 				auto id = builder.associateResultID(reinterpret_cast<uintptr_t>(inst));
-				builder.setResultType(id, llvmTypeToSPIRVType(builder, DynamicLLVM::LLVMTypeOf(inst)));
+				builder.setResultType(id, local.rootOf(inst) ? local.offsetType() : llvmTypeToSPIRVType(builder, DynamicLLVM::LLVMTypeOf(inst)));
 			}
 		}
 	}
@@ -3696,6 +4263,10 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 				} break;
 
 				case LLVMAlloca: {
+					if (local.rootOf(inst)) {
+						// declared at its first access
+						break;
+					}
 					// a local variable that the passes run on the module could not turn into SSA values
 					auto count = DynamicLLVM::LLVMGetOperand(inst, 0);
 					if (!DynamicLLVM::LLVMIsAConstantInt(count) || DynamicLLVM::LLVMConstIntGetZExtValue(count) != 1) {
@@ -3712,6 +4283,10 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 				//       (since i *think* that's the same addressing mode used by Metal code)
 
 				case LLVMGetElementPtr: {
+					if (local.rootOf(inst)) {
+						local.define(inst, local.getelementptr(inst));
+						break;
+					}
 					// Metal declares packed_T3 elements as 3 * sizeof(T) bytes, while a 3-lane vector,
 					// alone or inside an array or struct, covers its allocation size. Which one such a GEP
 					// means is unknown (reinterpreting packed_float3* as float3* also produces it), so
@@ -3736,6 +4311,14 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 					auto alignment = DynamicLLVM::LLVMGetAlignment(inst);
 					auto ptr = DynamicLLVM::LLVMGetOperand(inst, 0);
 					auto targetType = DynamicLLVM::LLVMTypeOf(inst);
+					if (auto root = local.rootOf(ptr)) {
+						LayoutFreeScope layoutFree(true);
+						auto type = llvmTypeToSPIRVType(builder, targetType);
+						auto resID = builder.encodeLoad(type, local.elementPointer(*root, local.offsetOf(ptr)));
+						builder.associateExistingResultID(resID, reinterpret_cast<uintptr_t>(inst));
+						builder.setResultType(resID, type);
+						break;
+					}
 					auto type = llvmTypeToSPIRVType(builder, targetType);
 					auto op = llvmValueToResultID(builder, ptr);
 					// A pointer operand's recorded type is what carries the storage
@@ -3808,6 +4391,10 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 					auto llval = DynamicLLVM::LLVMGetOperand(inst, 0);
 					auto llptr = DynamicLLVM::LLVMGetOperand(inst, 1);
 					auto val = llvmValueToResultID(builder, llval);
+					if (auto root = local.rootOf(llptr)) {
+						builder.encodeStore(local.elementPointer(*root, local.offsetOf(llptr)), val);
+						break;
+					}
 					auto ptr = llvmValueToResultID(builder, llptr);
 
 					// TODO: also handle runtime arrays properly here
@@ -3965,7 +4552,7 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 						});
 					} else if (translateAirSimd(builder, inst, name, type, resID)) {
 						// handled
-					} else if (translateAirAtomic(builder, inst, name, type, resID)) {
+					} else if (translateAirAtomic(builder, local, inst, name, type, resID)) {
 						// handled
 					} else if (name == "air.discard_fragment") {
 						builder.encodeOpWithoutResult(SPIRV::Opcode::Kill, {});
@@ -4108,6 +4695,13 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 							throw std::runtime_error("TODO: handle icmp predicate: " + std::to_string(DynamicLLVM::LLVMGetICmpPredicate(inst)));
 					}
 
+					if (local.rootOf(op1)) {
+						// two pointers into one variable addressed by byte offset (the analysis checked this): compare the offsets
+						auto resID = builder.encodeOp(comparison, type, { local.materialize(local.offsetOf(op1)), local.materialize(local.offsetOf(op2)) });
+						builder.associateExistingResultID(resID, reinterpret_cast<uintptr_t>(inst));
+						builder.setResultType(resID, type);
+						break;
+					}
 					auto operandType = *builder.reverseLookupType(llvmTypeToSPIRVType(builder, DynamicLLVM::LLVMTypeOf(op1)));
 					// device and constant pointers compare as addresses; a physical pointer has no null constant
 					auto operand = [&](LLVMValueRef value) {
@@ -4138,6 +4732,17 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 				} break;
 
 				case LLVMSelect: {
+					if (local.rootOf(inst)) {
+						auto choice = [&](unsigned i) {
+							auto value = DynamicLLVM::LLVMGetOperand(inst, i);
+							return isUndefined(value) ? builder.declareUndefinedValue(local.offsetType()) : local.materialize(local.offsetOf(value));
+						};
+						auto resID = builder.encodeOp(SPIRV::Opcode::Select, local.offsetType(), {
+							llvmValueToResultID(builder, DynamicLLVM::LLVMGetOperand(inst, 0)), choice(1), choice(2),
+						});
+						local.define(inst, LocalMemory::Offset { resID, 0 });
+						break;
+					}
 					auto type = llvmTypeToSPIRVType(builder, DynamicLLVM::LLVMTypeOf(inst));
 					auto resID = builder.encodeOp(SPIRV::Opcode::Select, type, {
 						llvmValueToResultID(builder, DynamicLLVM::LLVMGetOperand(inst, 0)),
@@ -4366,7 +4971,9 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 
 				case LLVMPHI: {
 					auto lltype = DynamicLLVM::LLVMTypeOf(inst);
-					auto type = llvmTypeToSPIRVType(builder, lltype);
+					// a pointer into memory addressed by byte offset is its offset
+					bool offset = local.rootOf(inst) != nullptr;
+					auto type = offset ? local.offsetType() : llvmTypeToSPIRVType(builder, lltype);
 
 					std::vector<std::pair<SPIRV::ResultID, SPIRV::ResultID>> variablesAndBlocks;
 					std::vector<uintptr_t> forwardValues;
@@ -4389,19 +4996,31 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 
 						// a value coming in over a back edge may not have been translated yet
 						bool forward = builder.lookupResultID(reinterpret_cast<uintptr_t>(variable)) == SPIRV::ResultIDInvalid &&
-							DynamicLLVM::LLVMGetValueKind(variable) == LLVMInstructionValueKind;
-						variablesAndBlocks.push_back(std::make_pair(forward ? SPIRV::ResultIDInvalid : llvmValueToResultID(builder, variable), label));
+							DynamicLLVM::LLVMGetValueKind(variable) == LLVMInstructionValueKind && !(offset && local.isRoot(variable));
+						auto value = forward ? SPIRV::ResultIDInvalid
+							: !offset ? llvmValueToResultID(builder, variable)
+							: isUndefined(variable) ? builder.declareUndefinedValue(type)
+							: local.materialize(local.offsetOf(variable));
+						variablesAndBlocks.push_back(std::make_pair(value, label));
 						forwardValues.push_back(forward ? reinterpret_cast<uintptr_t>(variable) : 0);
 					}
 
 					auto resID = builder.encodePhi(type, variablesAndBlocks, builder.lookupResultID(reinterpret_cast<uintptr_t>(inst)), forwardValues);
 
+					if (offset) {
+						local.define(inst, LocalMemory::Offset { resID, 0 });
+						break;
+					}
 					builder.associateExistingResultID(resID, reinterpret_cast<uintptr_t>(inst));
 					builder.setResultType(resID, type);
 				} break;
 
 				case LLVMBitCast: {
 					auto arg = DynamicLLVM::LLVMGetOperand(inst, 0);
+					if (local.rootOf(inst)) {
+						local.define(inst, local.offsetOf(arg));
+						break;
+					}
 					auto argID = llvmValueToResultID(builder, arg);
 					auto origType = builder.lookupResultType(argID);
 

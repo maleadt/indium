@@ -88,12 +88,180 @@ define void @pointer_integer(ptr addrspace(1) %out, ptr addrspace(1) %in, i32 %i
   ret void
 }
 
+@buf = internal addrspace(3) global [64 x i32] undef, align 4
+
+; threadgroup int buf[64]; buf[id] = in[id]; buf[id + 32] = in[id + 32]; threadgroup int* p = buf + id;
+; out[id] = p[1], a getelementptr on a derived pointer
+define void @threadgroup_derived(ptr addrspace(1) %out, ptr addrspace(1) %in, i32 %id) #0 {
+  %i = zext i32 %id to i64
+  %i32 = add i64 %i, 32
+  %a = getelementptr inbounds i32, ptr addrspace(1) %in, i64 %i
+  %b = getelementptr inbounds i32, ptr addrspace(1) %in, i64 %i32
+  %va = load i32, ptr addrspace(1) %a, align 4
+  %vb = load i32, ptr addrspace(1) %b, align 4
+  %p = getelementptr inbounds [64 x i32], ptr addrspace(3) @buf, i64 0, i64 %i
+  %q = getelementptr inbounds [64 x i32], ptr addrspace(3) @buf, i64 0, i64 %i32
+  store i32 %va, ptr addrspace(3) %p, align 4
+  store i32 %vb, ptr addrspace(3) %q, align 4
+  call void @air.wg.barrier(i32 2, i32 1)
+  %p1 = getelementptr inbounds i32, ptr addrspace(3) %p, i64 1
+  %v = load i32, ptr addrspace(3) %p1, align 4
+  %o = getelementptr inbounds i32, ptr addrspace(1) %out, i64 %i
+  store i32 %v, ptr addrspace(1) %o, align 4
+  ret void
+}
+
+; int t[8], filled at byte offsets as LLVM 19+ writes constant indices; int* p = t + (id & 3);
+; out[id] = p[0] + p[1] = in[id + k] + in[id + k + 1] with k = id & 3
+define void @private_derived(ptr addrspace(1) %out, ptr addrspace(1) %in, i32 %id) #0 {
+entry:
+  %t = alloca [8 x i32], align 4
+  %i = zext i32 %id to i64
+  %src = getelementptr inbounds i32, ptr addrspace(1) %in, i64 %i
+  br label %fill
+
+fill:
+  %j = phi i64 [ 0, %entry ], [ %j1, %fill ]
+  %s = getelementptr inbounds i32, ptr addrspace(1) %src, i64 %j
+  %v = load i32, ptr addrspace(1) %s, align 4
+  %byte = shl i64 %j, 2
+  %d = getelementptr inbounds i8, ptr %t, i64 %byte
+  store i32 %v, ptr %d, align 4
+  %j1 = add i64 %j, 1
+  %done = icmp eq i64 %j1, 8
+  br i1 %done, label %read, label %fill
+
+read:
+  %k = and i64 %i, 3
+  %p = getelementptr inbounds i32, ptr %t, i64 %k
+  %a = load i32, ptr %p, align 4
+  %p1 = getelementptr inbounds i8, ptr %p, i64 4
+  %b = load i32, ptr %p1, align 4
+  %sum = add i32 %a, %b
+  %o = getelementptr inbounds i32, ptr addrspace(1) %out, i64 %i
+  store i32 %sum, ptr addrspace(1) %o, align 4
+  ret void
+}
+
+@pool = internal addrspace(3) global [128 x i8] undef, align 4
+
+; threadgroup memory as Metal.jl declares it, bytes read as ints: a 1-based index from a base 4 bytes
+; before the pool, and a byte offset; out[id] = in[31 - id]
+define void @threadgroup_bytes(ptr addrspace(1) %out, ptr addrspace(1) %in, i32 %id) #0 {
+  %i = zext i32 %id to i64
+  %a = getelementptr inbounds i32, ptr addrspace(1) %in, i64 %i
+  %v = load i32, ptr addrspace(1) %a, align 4
+  %i1 = add i64 %i, 1
+  %p = getelementptr i32, ptr addrspace(3) getelementptr (i8, ptr addrspace(3) @pool, i64 -4), i64 %i1
+  store i32 %v, ptr addrspace(3) %p, align 4
+  call void @air.wg.barrier(i32 2, i32 1)
+  %r = sub i64 31, %i
+  %byte = shl i64 %r, 2
+  %q = getelementptr inbounds i8, ptr addrspace(3) @pool, i64 %byte
+  %w = load i32, ptr addrspace(3) %q, align 4
+  %o = getelementptr inbounds i32, ptr addrspace(1) %out, i64 %i
+  store i32 %w, ptr addrspace(1) %o, align 4
+  ret void
+}
+
+@bytes = internal addrspace(3) global [32 x i8] undef, align 1
+
+; a byte per thread, written next to the neighbours' bytes: out[id] = in[31 - id] & 0xff
+define void @threadgroup_subword(ptr addrspace(1) %out, ptr addrspace(1) %in, i32 %id) #0 {
+  %i = zext i32 %id to i64
+  %a = getelementptr inbounds i32, ptr addrspace(1) %in, i64 %i
+  %v = load i32, ptr addrspace(1) %a, align 4
+  %b = trunc i32 %v to i8
+  %p = getelementptr inbounds i8, ptr addrspace(3) @bytes, i64 %i
+  store i8 %b, ptr addrspace(3) %p, align 1
+  call void @air.wg.barrier(i32 2, i32 1)
+  %r = sub i64 31, %i
+  %q = getelementptr inbounds i8, ptr addrspace(3) @bytes, i64 %r
+  %w = load i8, ptr addrspace(3) %q, align 1
+  %x = zext i8 %w to i32
+  %o = getelementptr inbounds i32, ptr addrspace(1) %out, i64 %i
+  store i32 %x, ptr addrspace(1) %o, align 4
+  ret void
+}
+
+@wide = internal addrspace(3) global [256 x i8] undef, align 4
+
+; pointers into threadgroup memory chosen by a select and carried around a loop by a phi, and
+; compared: out[id] = p == wide ? -1 : in[id] + ... + in[id + n - 1], where p = id odd ? wide + id : wide,
+; n = 4 + (id & 3) (not a constant, so that the loop and its phi stay), and wide holds in[0..63]
+define void @threadgroup_phi(ptr addrspace(1) %out, ptr addrspace(1) %in, i32 %id) #0 {
+entry:
+  %i = zext i32 %id to i64
+  %i32 = add i64 %i, 32
+  %a = getelementptr inbounds i32, ptr addrspace(1) %in, i64 %i
+  %b = getelementptr inbounds i32, ptr addrspace(1) %in, i64 %i32
+  %va = load i32, ptr addrspace(1) %a, align 4
+  %vb = load i32, ptr addrspace(1) %b, align 4
+  %byte = shl i64 %i, 2
+  %pi = getelementptr inbounds i8, ptr addrspace(3) @wide, i64 %byte
+  %pj = getelementptr inbounds i8, ptr addrspace(3) %pi, i64 128
+  store i32 %va, ptr addrspace(3) %pi, align 4
+  store i32 %vb, ptr addrspace(3) %pj, align 4
+  call void @air.wg.barrier(i32 2, i32 1)
+  %odd = trunc i32 %id to i1
+  %start = select i1 %odd, ptr addrspace(3) %pi, ptr addrspace(3) @wide
+  %same = icmp eq ptr addrspace(3) %start, @wide
+  %extra = and i32 %id, 3
+  %n = add i32 %extra, 4
+  br i1 %same, label %exit, label %loop
+
+loop:
+  %p = phi ptr addrspace(3) [ %start, %entry ], [ %next, %loop ]
+  %k = phi i32 [ 0, %entry ], [ %k1, %loop ]
+  %sum = phi i32 [ 0, %entry ], [ %sum1, %loop ]
+  %v = load i32, ptr addrspace(3) %p, align 4
+  %sum1 = add i32 %sum, %v
+  %next = getelementptr inbounds i32, ptr addrspace(3) %p, i64 1
+  %k1 = add i32 %k, 1
+  %done = icmp eq i32 %k1, %n
+  br i1 %done, label %exit, label %loop
+
+exit:
+  %r = phi i32 [ -1, %entry ], [ %sum1, %loop ]
+  %o = getelementptr inbounds i32, ptr addrspace(1) %out, i64 %i
+  store i32 %r, ptr addrspace(1) %o, align 4
+  ret void
+}
+
+@counter = internal addrspace(3) global [8 x i8] undef, align 4
+
+; an atomic on an int at a byte offset into threadgroup memory: out[id] = 32
+define void @threadgroup_atomic(ptr addrspace(1) %out, ptr addrspace(1) %in, i32 %id) #0 {
+entry:
+  %c = getelementptr inbounds i8, ptr addrspace(3) @counter, i64 4
+  %first = icmp eq i32 %id, 0
+  br i1 %first, label %init, label %count
+
+init:
+  store i32 0, ptr addrspace(3) %c, align 4
+  br label %count
+
+count:
+  call void @air.wg.barrier(i32 2, i32 1)
+  %old = call i32 @air.atomic.local.add.s.i32(ptr addrspace(3) %c, i32 1, i32 0, i32 1, i1 true)
+  call void @air.wg.barrier(i32 2, i32 1)
+  %v = load i32, ptr addrspace(3) %c, align 4
+  %i = zext i32 %id to i64
+  %o = getelementptr inbounds i32, ptr addrspace(1) %out, i64 %i
+  store i32 %v, ptr addrspace(1) %o, align 4
+  ret void
+}
+
+declare void @air.wg.barrier(i32, i32) #1
+declare i32 @air.atomic.local.add.s.i32(ptr addrspace(3), i32, i32, i32, i1) #1
+
+attributes #1 = { convergent nounwind }
 attributes #0 = { nounwind }
 
 !llvm.module.flags = !{!0}
 !air.version = !{!1}
 !air.language_version = !{!2}
-!air.kernel = !{!10, !20, !30, !31, !32}
+!air.kernel = !{!10, !20, !30, !31, !32, !40, !41, !42, !43, !44, !45}
 
 !0 = !{i32 1, !"wchar_size", i32 4}
 !1 = !{i32 2, i32 2, i32 0}
@@ -115,3 +283,9 @@ attributes #0 = { nounwind }
 !30 = !{ptr @pointer_select, !3, !7}
 !31 = !{ptr @pointer_phi, !3, !7}
 !32 = !{ptr @pointer_integer, !3, !7}
+!40 = !{ptr @threadgroup_derived, !3, !7}
+!41 = !{ptr @private_derived, !3, !7}
+!42 = !{ptr @threadgroup_bytes, !3, !7}
+!43 = !{ptr @threadgroup_subword, !3, !7}
+!44 = !{ptr @threadgroup_phi, !3, !7}
+!45 = !{ptr @threadgroup_atomic, !3, !7}

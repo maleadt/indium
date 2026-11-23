@@ -6,7 +6,16 @@ Compute kernels that reach memory through the pointer shapes AIR producers emit:
   read at a byte offset;
 - `loaded_pointer`: a device pointer loaded from a buffer, then indexed;
 - `pointer_select`, `pointer_phi`, `pointer_integer`: device pointers chosen by a `select`, carried
-  around a loop by a `phi`, and converted to and from integers and compared with null.
+  around a loop by a `phi`, and converted to and from integers and compared with null;
+- `threadgroup_derived`, `private_derived`: a `getelementptr` on a pointer derived from a threadgroup
+  or private array (`p = buf + id; p[1]`), and byte offsets into it;
+- `threadgroup_bytes`: threadgroup memory declared as bytes, as Metal.jl declares it, read and
+  written as ints through a base before the array and through byte offsets;
+- `threadgroup_subword`: threads writing neighbouring bytes of threadgroup memory;
+- `threadgroup_phi`: threadgroup pointers chosen by a `select`, carried by a `phi` and compared;
+- `threadgroup_atomic`: an atomic at a byte offset into threadgroup memory.
+
+`refused/escaped.ll` converts a threadgroup address to an integer, which has no translation.
 
 Each thread writes one int, and the host compares it with the value the kernel's comment defines.
 `check.sh` (registered with ctest) translates the library with `mtl2spv`, validates it with
@@ -19,7 +28,11 @@ in the MTLB container Iridium reads:
 
     llvm-as shadersrc/addressing.ll -o addressing.air
     ../air-ops/make-metallib.py addressing.air addressing.metallib kernel:undeclared_struct kernel:loaded_pointer \
-        kernel:pointer_select kernel:pointer_phi kernel:pointer_integer
+        kernel:pointer_select kernel:pointer_phi kernel:pointer_integer kernel:threadgroup_derived \
+        kernel:private_derived kernel:threadgroup_bytes kernel:threadgroup_subword kernel:threadgroup_phi \
+        kernel:threadgroup_atomic
+
+and each `refused/<name>.ll` the same way, with `kernel:<name>`.
 
 Assemble with an LLVM no newer than the oldest Iridium supports (LLVM 19), since newer bitcode may
 not be readable by an older one. These were assembled with LLVM 18.
