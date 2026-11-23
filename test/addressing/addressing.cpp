@@ -136,6 +136,10 @@ int main(int argc, char** argv) {
 		}) && ok;
 		ok = check(device.get(), library, "threadgroup_dead", in, {}, [&](int32_t i) { return values[i]; }) && ok;
 
+		ok = check(device.get(), library, "private_merged", in, {},
+			[&](int32_t i) { return i % 2 ? values[i + (i & 3)] + 1000 : values[i + (i & 3) + 8]; }) && ok;
+		ok = check(device.get(), library, "threadgroup_merged", in, {}, [&](int32_t i) { return values[31 - i + (i % 2 ? 0 : 32)]; }) && ok;
+
 		keepPollingDevice = false;
 		device->wakeupEventLoop();
 		devicePollingThread.join();
