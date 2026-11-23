@@ -97,6 +97,10 @@ int main(int argc, char** argv) {
 		ok = check(device.get(), library, "loaded_pointer", buffer(device.get(), array), { in },
 			[&](int32_t i) { return 2 * values[i]; }) && ok;
 
+		ok = check(device.get(), library, "pointer_select", in, {}, [&](int32_t i) { return values[i % 2 ? i : i + 32]; }) && ok;
+		ok = check(device.get(), library, "pointer_phi", in, {}, [&](int32_t i) { return values[i] + values[i + 1] + values[i + 2] + values[i + 3]; }) && ok;
+		ok = check(device.get(), library, "pointer_integer", in, {}, [&](int32_t i) { return values[i + 1]; }) && ok;
+
 		keepPollingDevice = false;
 		device->wakeupEventLoop();
 		devicePollingThread.join();
