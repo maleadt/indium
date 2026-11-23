@@ -4813,9 +4813,20 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 							throw std::runtime_error("TODO: handle icmp predicate: " + std::to_string(DynamicLLVM::LLVMGetICmpPredicate(inst)));
 					}
 
-					auto lhs = llvmValueToResultID(builder, op1);
-					auto rhs = llvmValueToResultID(builder, op2);
 					auto operandType = *builder.reverseLookupType(llvmTypeToSPIRVType(builder, DynamicLLVM::LLVMTypeOf(op1)));
+					// device and constant pointers compare as addresses; a physical pointer has no null constant
+					auto operand = [&](LLVMValueRef value) {
+						if (operandType.backingType != SPIRV::Type::BackingType::Pointer) {
+							return llvmValueToResultID(builder, value);
+						}
+						auto uint64Type = builder.declareType(SPIRV::Type(SPIRV::Type::IntegerTag {}, 64, false));
+						if (DynamicLLVM::LLVMGetValueKind(value) == LLVMConstantPointerNullValueKind) {
+							return builder.declareConstantScalar<uint64_t>(0);
+						}
+						return builder.encodeConvertPtrToU(uint64Type, llvmValueToResultID(builder, value));
+					};
+					auto lhs = operand(op1);
+					auto rhs = operand(op2);
 					auto operandComponent = operandType.backingType == SPIRV::Type::BackingType::Vector ? *builder.reverseLookupType(operandType.targetType) : operandType;
 					if (operandComponent.backingType == SPIRV::Type::BackingType::Boolean) {
 						// only equality is defined on SPIR-V booleans
@@ -5163,6 +5174,40 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 
 					builder.associateExistingResultID(resID, reinterpret_cast<uintptr_t>(inst));
 					builder.setResultType(resID, resultType);
+				} break;
+
+				case LLVMPtrToInt: {
+					auto pointer = llvmValueToResultID(builder, DynamicLLVM::LLVMGetOperand(inst, 0));
+					auto pointerType = builder.reverseLookupType(builder.lookupResultType(pointer));
+					if (!pointerType || pointerType->backingType != SPIRV::Type::BackingType::Pointer
+						|| pointerType->pointerStorageClass != SPIRV::StorageClass::PhysicalStorageBuffer) {
+						throw ImpossibleResultID("ptrtoint of a pointer that has no address (thread or threadgroup memory)");
+					}
+					auto type = llvmTypeToSPIRVType(builder, DynamicLLVM::LLVMTypeOf(inst));
+					auto uint64Type = builder.declareType(SPIRV::Type(SPIRV::Type::IntegerTag {}, 64, false));
+					auto address = builder.encodeConvertPtrToU(uint64Type, pointer);
+					auto resID = DynamicLLVM::LLVMGetIntTypeWidth(DynamicLLVM::LLVMTypeOf(inst)) == 64
+						? builder.encodeBitcast(type, address)
+						: encodeUnsignedResultOp(builder, SPIRV::Opcode::UConvert, type, { address });
+
+					builder.associateExistingResultID(resID, reinterpret_cast<uintptr_t>(inst));
+					builder.setResultType(resID, type);
+				} break;
+
+				case LLVMIntToPtr: {
+					// only a device or constant pointer has an address to convert from
+					auto type = llvmTypeToSPIRVType(builder, DynamicLLVM::LLVMTypeOf(inst));
+					auto source = DynamicLLVM::LLVMGetOperand(inst, 0);
+					auto address = llvmValueToResultID(builder, source);
+					if (DynamicLLVM::LLVMGetIntTypeWidth(DynamicLLVM::LLVMTypeOf(source)) != 64) {
+						// inttoptr zero-extends a narrower integer
+						auto uint64Type = builder.declareType(SPIRV::Type(SPIRV::Type::IntegerTag {}, 64, false));
+						address = builder.encodeUConvert(uint64Type, address);
+					}
+					auto resID = builder.encodeConvertUToPtr(type, address);
+
+					builder.associateExistingResultID(resID, reinterpret_cast<uintptr_t>(inst));
+					builder.setResultType(resID, type);
 				} break;
 
 				case LLVMFPTrunc: {
