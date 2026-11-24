@@ -752,7 +752,7 @@ static Iridium::SPIRV::ResultID llvmValueToResultID(Iridium::SPIRV::Builder& bui
 
 		case LLVMPoisonValueValueKind:
 		case LLVMUndefValueValueKind: {
-			return builder.declareUndefinedValue(llvmTypeToSPIRVType(builder, type));
+			return builder.declareUndefinedValue(llvmTypeToSPIRVType(builder, type, true));
 		} break;
 
 		case LLVMConstantAggregateZeroValueKind: {
