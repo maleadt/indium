@@ -5155,7 +5155,7 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 		for (LLVMValueRef inst = DynamicLLVM::LLVMGetFirstInstruction(bb); inst != nullptr; inst = DynamicLLVM::LLVMGetNextInstruction(inst)) {
 			if (DynamicLLVM::LLVMGetInstructionOpcode(inst) == LLVMPHI) {
 				auto id = builder.associateResultID(reinterpret_cast<uintptr_t>(inst));
-				builder.setResultType(id, local.rootOf(inst) ? local.offsetType() : llvmTypeToSPIRVType(builder, DynamicLLVM::LLVMTypeOf(inst)));
+				builder.setResultType(id, local.rootOf(inst) ? local.offsetType() : llvmTypeToSPIRVType(builder, DynamicLLVM::LLVMTypeOf(inst), true));
 			}
 		}
 	}
@@ -5740,7 +5740,7 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 						builder.setResultType(resID, type);
 						break;
 					}
-					auto operandType = *builder.reverseLookupType(llvmTypeToSPIRVType(builder, DynamicLLVM::LLVMTypeOf(op1)));
+					auto operandType = *builder.reverseLookupType(llvmTypeToSPIRVType(builder, DynamicLLVM::LLVMTypeOf(op1), true));
 					// device and constant pointers compare as addresses; a physical pointer has no null constant
 					auto operand = [&](LLVMValueRef value) {
 						if (operandType.backingType != SPIRV::Type::BackingType::Pointer) {
@@ -5781,7 +5781,7 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 						local.define(inst, LocalMemory::Offset { resID, 0 });
 						break;
 					}
-					auto type = llvmTypeToSPIRVType(builder, DynamicLLVM::LLVMTypeOf(inst));
+					auto type = llvmTypeToSPIRVType(builder, DynamicLLVM::LLVMTypeOf(inst), true);
 					auto resID = builder.encodeOp(SPIRV::Opcode::Select, type, {
 						llvmValueToResultID(builder, DynamicLLVM::LLVMGetOperand(inst, 0)),
 						llvmValueToResultID(builder, DynamicLLVM::LLVMGetOperand(inst, 1)),
@@ -6023,7 +6023,7 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 					auto lltype = DynamicLLVM::LLVMTypeOf(inst);
 					// a pointer into memory addressed by byte offset is its offset
 					bool offset = local.rootOf(inst) != nullptr;
-					auto type = offset ? local.offsetType() : llvmTypeToSPIRVType(builder, lltype);
+					auto type = offset ? local.offsetType() : llvmTypeToSPIRVType(builder, lltype, true);
 
 					std::vector<std::pair<SPIRV::ResultID, SPIRV::ResultID>> variablesAndBlocks;
 					std::vector<uintptr_t> forwardValues;
@@ -6148,7 +6148,7 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 
 				case LLVMIntToPtr: {
 					// only a device or constant pointer has an address to convert from
-					auto type = llvmTypeToSPIRVType(builder, DynamicLLVM::LLVMTypeOf(inst));
+					auto type = llvmTypeToSPIRVType(builder, DynamicLLVM::LLVMTypeOf(inst), true);
 					auto source = DynamicLLVM::LLVMGetOperand(inst, 0);
 					auto address = llvmValueToResultID(builder, source);
 					if (DynamicLLVM::LLVMGetIntTypeWidth(DynamicLLVM::LLVMTypeOf(source)) != 64) {
