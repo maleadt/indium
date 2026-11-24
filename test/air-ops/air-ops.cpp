@@ -292,8 +292,8 @@ static bool testReflection(Indium::Device* device) {
 	auto library = device->newLibrary(air_ops_metallib, air_ops_metallib_len);
 	auto kernels = library->functionNames();
 	std::sort(kernels.begin(), kernels.end());
-	if (kernels != std::vector<std::string> { "control_flow", "float_ops", "int_ops", "table_lookup" }) {
-		std::cerr << "reflection: the library does not list its four kernels" << std::endl;
+	if (kernels != std::vector<std::string> { "control_flow", "float_ops", "int_ops", "table_lookup", "trunc_freeze" }) {
+		std::cerr << "reflection: the library does not list its five kernels" << std::endl;
 		return false;
 	}
 
