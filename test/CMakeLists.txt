@@ -70,6 +70,7 @@ add_subdirectory(physical-pointer)
 add_subdirectory(wide-vector-bitcast)
 add_subdirectory(pipeline-bench)
 add_subdirectory(pipeline-cache)
+add_subdirectory(quad-functions)
 add_subdirectory(diagnostics)
 
 # cube, cubemap, lighting and texturing include <glm/gtx/transform.hpp> and
